@@ -14,6 +14,16 @@ pub struct PeerMetadata {
         ::prost::alloc::string::String,
     >,
 }
+/// RegisterAck acknowledges peer registration.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RegisterAck {
+    #[prost(bool, tag = "1")]
+    pub accepted: bool,
+    #[prost(string, tag = "2")]
+    pub assigned_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
 /// Heartbeat messages keep sessions alive.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HeartbeatRequest {
@@ -28,6 +38,33 @@ pub struct HeartbeatResponse {
     pub accepted: bool,
     #[prost(string, tag = "2")]
     pub reason: ::prost::alloc::string::String,
+}
+/// UpdateMethods communicates the callable methods list.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MethodDescriptor {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub description: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(map = "string, string", tag = "4")]
+    pub extra: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateMethodsRequest {
+    #[prost(string, tag = "1")]
+    pub peer_id: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub methods: ::prost::alloc::vec::Vec<MethodDescriptor>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateMethodsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
 }
 /// InvokeRequest asks grpc-mesh-node to execute a method.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -70,45 +107,6 @@ pub struct ErrorDetail {
     #[prost(bytes = "vec", tag = "3")]
     pub details: ::prost::alloc::vec::Vec<u8>,
 }
-/// RegisterAck acknowledges peer registration.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RegisterAck {
-    #[prost(bool, tag = "1")]
-    pub accepted: bool,
-    #[prost(string, tag = "2")]
-    pub assigned_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub reason: ::prost::alloc::string::String,
-}
-/// UpdateMethods communicates the callable methods list.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct UpdateMethodsRequest {
-    #[prost(string, tag = "1")]
-    pub peer_id: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "2")]
-    pub methods: ::prost::alloc::vec::Vec<MethodDescriptor>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MethodDescriptor {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub description: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "3")]
-    pub tags: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(map = "string, string", tag = "4")]
-    pub extra: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct UpdateMethodsResponse {
-    #[prost(bool, tag = "1")]
-    pub success: bool,
-    #[prost(string, tag = "2")]
-    pub message: ::prost::alloc::string::String,
-}
 /// Generated client implementations.
 pub mod control_plane_client {
     #![allow(
@@ -120,7 +118,7 @@ pub mod control_plane_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// ControlPlane coordinates registration and heartbeats.
+    /// ControlPlane handles peer lifecycle.
     #[derive(Debug, Clone)]
     pub struct ControlPlaneClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -226,7 +224,7 @@ pub mod control_plane_client {
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::HeartbeatRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::HeartbeatResponse>,
+            tonic::Response<tonic::codec::Streaming<super::HeartbeatResponse>>,
             tonic::Status,
         > {
             self.inner
@@ -244,7 +242,7 @@ pub mod control_plane_client {
             let mut req = request.into_streaming_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("waemu.rpc.v1.ControlPlane", "Heartbeat"));
-            self.inner.client_streaming(req, path, codec).await
+            self.inner.streaming(req, path, codec).await
         }
         pub async fn update_methods(
             &mut self,
@@ -289,13 +287,16 @@ pub mod control_plane_server {
             &self,
             request: tonic::Request<super::PeerMetadata>,
         ) -> std::result::Result<tonic::Response<super::RegisterAck>, tonic::Status>;
+        /// Server streaming response type for the Heartbeat method.
+        type HeartbeatStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::HeartbeatResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         async fn heartbeat(
             &self,
             request: tonic::Request<tonic::Streaming<super::HeartbeatRequest>>,
-        ) -> std::result::Result<
-            tonic::Response<super::HeartbeatResponse>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<Self::HeartbeatStream>, tonic::Status>;
         async fn update_methods(
             &self,
             request: tonic::Request<super::UpdateMethodsRequest>,
@@ -304,7 +305,7 @@ pub mod control_plane_server {
             tonic::Status,
         >;
     }
-    /// ControlPlane coordinates registration and heartbeats.
+    /// ControlPlane handles peer lifecycle.
     #[derive(Debug)]
     pub struct ControlPlaneServer<T> {
         inner: Arc<T>,
@@ -431,11 +432,12 @@ pub mod control_plane_server {
                     struct HeartbeatSvc<T: ControlPlane>(pub Arc<T>);
                     impl<
                         T: ControlPlane,
-                    > tonic::server::ClientStreamingService<super::HeartbeatRequest>
+                    > tonic::server::StreamingService<super::HeartbeatRequest>
                     for HeartbeatSvc<T> {
                         type Response = super::HeartbeatResponse;
+                        type ResponseStream = T::HeartbeatStream;
                         type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
+                            tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
@@ -468,7 +470,7 @@ pub mod control_plane_server {
                                 max_decoding_message_size,
                                 max_encoding_message_size,
                             );
-                        let res = grpc.client_streaming(method, req).await;
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -569,7 +571,7 @@ pub mod invoke_plane_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// InvokePlane performs remote method execution.
+    /// InvokePlane handles reverse RPC invocations.
     #[derive(Debug, Clone)]
     pub struct InvokePlaneClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -728,7 +730,7 @@ pub mod invoke_plane_server {
             tonic::Status,
         >;
     }
-    /// InvokePlane performs remote method execution.
+    /// InvokePlane handles reverse RPC invocations.
     #[derive(Debug)]
     pub struct InvokePlaneServer<T> {
         inner: Arc<T>,
