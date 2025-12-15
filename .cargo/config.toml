@@ -1,0 +1,27 @@
+[env]
+# setting in here doesn't work too
+# must use absolute path?
+ANDROID_NDK_HOME = { value = "/home/ethan/Android/Sdk/ndk/29.0.14033849", force = true }
+# 2. Set the C and C++ compilers for the `cc` crate.
+# We use the target-specific format `CC_{target}`.
+CC_aarch64_linux_android = { value = "/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang", force = true }
+CXX_aarch64_linux_android = { value = "/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++", force = true }
+AR_aarch64_linux_android = { value = "/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar", force = true }
+
+# 3. Provide the correct arguments to `bindgen` to find all C headers.
+# This includes the target, sysroot, and the compiler's private include directory.
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = { value = "--target=aarch64-linux-android --sysroot=/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/sysroot -nostdinc -I/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include -I/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android -I/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include", force = true }
+
+[target.aarch64-linux-android]
+# 1. Set the linker and archiver from the NDK.
+linker = "/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
+ar = "/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+rustflags = [
+    "-L",
+    "/home/ethan/Android/Sdk/ndk/29.0.14033849/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/lib/linux",
+    "-l",
+    "static=clang_rt.builtins-aarch64-android",
+]
+
+[build]
+target = "aarch64-linux-android"

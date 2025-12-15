@@ -1,0 +1,35 @@
+{
+  "server": {
+    "address": "127.0.0.1:8443",
+    "tls": {
+      "ca_cert_path": "config/ca.crt",
+      "server_name": "localhost"
+    }
+  },
+  "node": {
+    "id": "auto",
+    "token": "waemu_7RCx4i4T6gU3O9Gqcx4-SvHMRN1V8dJ9",
+    "version": "1.0.0",
+    "supported_features": ["invoke", "health", "echo"],
+    "metadata": {
+      "role": "reverse_gateway",
+      "environment": "development",
+      "_comment_token": "IMPORTANT: This token must match one in grpc-mesh-server/config/config.yaml security.allowed_tokens. Generate with: openssl rand -base64 32 | tr '+/' '-_' | cut -c1-40 && prefix with 'waemu_'. Or set via WA_NODE_TOKEN environment variable."
+    }
+  },
+  "heartbeat": {
+    "interval_secs": 10
+  },
+  "reconnect": {
+    "base_delay_secs": 1,
+    "max_delay_secs": 60,
+    "max_retries": 0
+  },
+  "yamux": {
+    "window_update_mode": "on_read",
+    "enable_keepalive": true
+  },
+  "logging": {
+    "level": "info"
+  }
+}
