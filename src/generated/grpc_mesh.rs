@@ -213,11 +213,13 @@ pub mod control_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waemu.rpc.v1.ControlPlane/RegisterPeer",
+                "/grpc_mesh.rpc.v1.ControlPlane/RegisterPeer",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("waemu.rpc.v1.ControlPlane", "RegisterPeer"));
+                .insert(
+                    GrpcMethod::new("grpc_mesh.rpc.v1.ControlPlane", "RegisterPeer"),
+                );
             self.inner.unary(req, path, codec).await
         }
         pub async fn heartbeat(
@@ -237,11 +239,11 @@ pub mod control_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waemu.rpc.v1.ControlPlane/Heartbeat",
+                "/grpc_mesh.rpc.v1.ControlPlane/Heartbeat",
             );
             let mut req = request.into_streaming_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("waemu.rpc.v1.ControlPlane", "Heartbeat"));
+                .insert(GrpcMethod::new("grpc_mesh.rpc.v1.ControlPlane", "Heartbeat"));
             self.inner.streaming(req, path, codec).await
         }
         pub async fn update_methods(
@@ -261,11 +263,13 @@ pub mod control_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waemu.rpc.v1.ControlPlane/UpdateMethods",
+                "/grpc_mesh.rpc.v1.ControlPlane/UpdateMethods",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("waemu.rpc.v1.ControlPlane", "UpdateMethods"));
+                .insert(
+                    GrpcMethod::new("grpc_mesh.rpc.v1.ControlPlane", "UpdateMethods"),
+                );
             self.inner.unary(req, path, codec).await
         }
     }
@@ -382,7 +386,7 @@ pub mod control_plane_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/waemu.rpc.v1.ControlPlane/RegisterPeer" => {
+                "/grpc_mesh.rpc.v1.ControlPlane/RegisterPeer" => {
                     #[allow(non_camel_case_types)]
                     struct RegisterPeerSvc<T: ControlPlane>(pub Arc<T>);
                     impl<
@@ -427,7 +431,7 @@ pub mod control_plane_server {
                     };
                     Box::pin(fut)
                 }
-                "/waemu.rpc.v1.ControlPlane/Heartbeat" => {
+                "/grpc_mesh.rpc.v1.ControlPlane/Heartbeat" => {
                     #[allow(non_camel_case_types)]
                     struct HeartbeatSvc<T: ControlPlane>(pub Arc<T>);
                     impl<
@@ -475,7 +479,7 @@ pub mod control_plane_server {
                     };
                     Box::pin(fut)
                 }
-                "/waemu.rpc.v1.ControlPlane/UpdateMethods" => {
+                "/grpc_mesh.rpc.v1.ControlPlane/UpdateMethods" => {
                     #[allow(non_camel_case_types)]
                     struct UpdateMethodsSvc<T: ControlPlane>(pub Arc<T>);
                     impl<
@@ -555,7 +559,7 @@ pub mod control_plane_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "waemu.rpc.v1.ControlPlane";
+    pub const SERVICE_NAME: &str = "grpc_mesh.rpc.v1.ControlPlane";
     impl<T> tonic::server::NamedService for ControlPlaneServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
@@ -666,11 +670,11 @@ pub mod invoke_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waemu.rpc.v1.InvokePlane/Invoke",
+                "/grpc_mesh.rpc.v1.InvokePlane/Invoke",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("waemu.rpc.v1.InvokePlane", "Invoke"));
+                .insert(GrpcMethod::new("grpc_mesh.rpc.v1.InvokePlane", "Invoke"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn invoke_stream(
@@ -690,11 +694,11 @@ pub mod invoke_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waemu.rpc.v1.InvokePlane/InvokeStream",
+                "/grpc_mesh.rpc.v1.InvokePlane/InvokeStream",
             );
             let mut req = request.into_streaming_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("waemu.rpc.v1.InvokePlane", "InvokeStream"));
+                .insert(GrpcMethod::new("grpc_mesh.rpc.v1.InvokePlane", "InvokeStream"));
             self.inner.streaming(req, path, codec).await
         }
     }
@@ -807,7 +811,7 @@ pub mod invoke_plane_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/waemu.rpc.v1.InvokePlane/Invoke" => {
+                "/grpc_mesh.rpc.v1.InvokePlane/Invoke" => {
                     #[allow(non_camel_case_types)]
                     struct InvokeSvc<T: InvokePlane>(pub Arc<T>);
                     impl<
@@ -852,7 +856,7 @@ pub mod invoke_plane_server {
                     };
                     Box::pin(fut)
                 }
-                "/waemu.rpc.v1.InvokePlane/InvokeStream" => {
+                "/grpc_mesh.rpc.v1.InvokePlane/InvokeStream" => {
                     #[allow(non_camel_case_types)]
                     struct InvokeStreamSvc<T: InvokePlane>(pub Arc<T>);
                     impl<
@@ -935,7 +939,7 @@ pub mod invoke_plane_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "waemu.rpc.v1.InvokePlane";
+    pub const SERVICE_NAME: &str = "grpc_mesh.rpc.v1.InvokePlane";
     impl<T> tonic::server::NamedService for InvokePlaneServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
