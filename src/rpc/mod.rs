@@ -25,19 +25,19 @@ use crate::{MethodRegistry, RpcError};
 /// that needs to interact with the mesh protocol.
 pub mod proto {
     #![allow(clippy::all, missing_docs)]
-    pub mod waemu {
+    pub mod grpc_mesh {
         pub mod rpc {
             pub mod v1 {
                 include!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/src/generated/waemu.rs"
+                    "/src/generated/grpc_mesh.rs"
                 ));
             }
         }
     }
 }
 
-use proto::waemu::rpc::v1::{
+use proto::grpc_mesh::rpc::v1::{
     ErrorDetail, InvokeRequest, InvokeResponse,
     invoke_plane_server::{InvokePlane, InvokePlaneServer},
 };
