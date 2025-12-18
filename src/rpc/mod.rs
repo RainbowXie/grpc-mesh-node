@@ -8,8 +8,21 @@ use tonic::{Request, Response, Status, async_trait};
 
 use crate::{MethodRegistry, RpcError};
 
-/// Re-export the protobuf-generated types so downstream modules do not have to
-/// reach into the `generated/` folder directly.
+/// Protocol buffer definitions for the InvokePlane gRPC service.
+///
+/// This module re-exports the generated protobuf types for the gRPC-Mesh RPC protocol.
+/// It includes the `InvokePlane` service definition and associated request/response types.
+///
+/// # Generated Types
+///
+/// - `InvokeRequest`: Request message for unary and streaming invocations
+/// - `InvokeResponse`: Response message containing results or errors
+/// - `ErrorDetail`: Structured error information
+/// - `InvokePlane`: Service trait for implementing the RPC handler
+/// - `InvokePlaneServer`: Server implementation wrapper
+///
+/// These types are used by both the `InvokeService` implementation and client code
+/// that needs to interact with the mesh protocol.
 pub mod proto {
     #![allow(clippy::all, missing_docs)]
     pub mod waemu {
@@ -31,19 +44,98 @@ use proto::waemu::rpc::v1::{
 
 const STREAM_BUFFER: usize = 16;
 
-/// gRPC service surface that executes method invocations against the local [`MethodRegistry`].
+/// gRPC service implementation that dispatches RPC invocations to local method handlers.
+///
+/// `InvokeService` implements the `InvokePlane` gRPC service by routing incoming
+/// requests to the appropriate handlers registered in a [`MethodRegistry`]. It provides:
+/// - Unary RPC support via `Invoke`
+/// - Bidirectional streaming via `InvokeStream`
+/// - Automatic error handling and response marshaling
+/// - Request timing and observability
+///
+/// This service is designed to be used with tonic's server builder and runs over
+/// the Yamux-multiplexed tunnel connection to the gRPC-Mesh server.
+///
+/// # Example
+///
+/// ```no_run
+/// use grpc_mesh_node::{MethodRegistry, rpc::InvokeService};
+/// use std::sync::Arc;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Create registry and register methods
+/// let registry = MethodRegistry::default();
+/// registry.register("calculator.add", Arc::new(|payload| {
+///     // Handler implementation...
+///     Ok(vec![42])
+/// }));
+///
+/// // Create service
+/// let service = InvokeService::new(registry);
+///
+/// // Convert to tonic server and serve
+/// let server = service.into_server();
+/// // Use with tonic::transport::Server::builder()...
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct InvokeService {
     registry: MethodRegistry,
 }
 
 impl InvokeService {
-    /// Creates an [`InvokeService`] bound to the provided registry.
+    /// Creates a new InvokeService with the given method registry.
+    ///
+    /// The service will route all incoming RPC requests to handlers registered
+    /// in the provided registry. The registry can be shared and updated even
+    /// after the service is created, as it uses interior mutability.
+    ///
+    /// # Parameters
+    ///
+    /// - `registry`: Method registry containing registered RPC handlers
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use grpc_mesh_node::{MethodRegistry, rpc::InvokeService};
+    /// use std::sync::Arc;
+    ///
+    /// let registry = MethodRegistry::default();
+    /// registry.register("echo", Arc::new(|payload| Ok(payload)));
+    ///
+    /// let service = InvokeService::new(registry);
+    /// ```
     pub fn new(registry: MethodRegistry) -> Self {
         Self { registry }
     }
 
-    /// Convenience helper to wrap the service in a tonic server.
+    /// Converts this service into a tonic server implementation.
+    ///
+    /// This is a convenience method that wraps the service in tonic's
+    /// `InvokePlaneServer` wrapper, making it ready to be added to a
+    /// `tonic::transport::Server`.
+    ///
+    /// # Returns
+    ///
+    /// A tonic server instance that can be added to a server builder.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use grpc_mesh_node::{MethodRegistry, rpc::InvokeService};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let registry = MethodRegistry::default();
+    /// let service = InvokeService::new(registry).into_server();
+    ///
+    /// tonic::transport::Server::builder()
+    ///     .add_service(service)
+    ///     .serve("0.0.0.0:50051".parse()?)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn into_server(self) -> InvokePlaneServer<Self> {
         InvokePlaneServer::new(self)
     }
@@ -51,6 +143,16 @@ impl InvokeService {
 
 #[async_trait]
 impl InvokePlane for InvokeService {
+    /// Handles unary RPC invocations.
+    ///
+    /// This method:
+    /// 1. Extracts the InvokeRequest from the gRPC request
+    /// 2. Routes it to the appropriate handler in the registry
+    /// 3. Captures timing information
+    /// 4. Returns the result or error wrapped in an InvokeResponse
+    ///
+    /// Errors from the handler are captured and returned in the response's
+    /// error field rather than as gRPC status errors.
     async fn invoke(
         &self,
         request: Request<InvokeRequest>,
@@ -61,6 +163,15 @@ impl InvokePlane for InvokeService {
 
     type InvokeStreamStream = ReceiverStream<Result<InvokeResponse, Status>>;
 
+    /// Handles bidirectional streaming RPC invocations.
+    ///
+    /// This method creates a bidirectional stream where:
+    /// - The client can send multiple InvokeRequest messages
+    /// - Each request is processed independently and its response is sent back
+    /// - The stream remains open until the client closes it or an error occurs
+    ///
+    /// Each request in the stream is handled by spawning a task that processes
+    /// requests from the inbound stream and sends responses to the outbound stream.
     async fn invoke_stream(
         &self,
         request: Request<tonic::Streaming<InvokeRequest>>,
@@ -90,6 +201,28 @@ impl InvokePlane for InvokeService {
     }
 }
 
+/// Executes a single RPC request against the method registry.
+///
+/// This function:
+/// 1. Validates the request (method name must not be empty)
+/// 2. Looks up and invokes the handler in the registry
+/// 3. Measures execution time
+/// 4. Constructs an InvokeResponse with the result or error
+///
+/// # Parameters
+///
+/// - `registry`: Method registry to look up handlers
+/// - `request`: InvokeRequest containing method name and payload
+///
+/// # Returns
+///
+/// - `Ok(InvokeResponse)`: Response with result or error details
+/// - `Err(Status)`: gRPC status error for invalid requests
+///
+/// # Errors
+///
+/// Returns a gRPC `INVALID_ARGUMENT` status if the method name is empty.
+/// Handler errors are captured in the response's error field.
 async fn execute_request(
     registry: &MethodRegistry,
     request: InvokeRequest,
@@ -126,6 +259,18 @@ async fn execute_request(
     })
 }
 
+/// Converts an RpcError into a protobuf ErrorDetail message.
+///
+/// This function maps internal RpcError types to the wire format used in
+/// gRPC responses, including error codes and human-readable messages.
+///
+/// # Parameters
+///
+/// - `err`: The RpcError to convert
+///
+/// # Returns
+///
+/// An ErrorDetail message ready to be included in an InvokeResponse.
 fn to_error_detail(err: RpcError) -> ErrorDetail {
     let code = err.code().to_string();
     let message = match &err {
@@ -142,6 +287,13 @@ fn to_error_detail(err: RpcError) -> ErrorDetail {
     }
 }
 
-/// Convenience alias for boxed streaming responses.
+/// Convenience type alias for boxed streaming responses.
+///
+/// This type represents a dynamic, pinned stream of InvokeResponse messages
+/// suitable for use in async contexts. It's primarily used for advanced
+/// streaming scenarios where the concrete stream type needs to be erased.
+///
+/// Most users should use the `InvokeStreamStream` type from the `InvokePlane`
+/// trait implementation instead.
 pub type InvokeStream =
     Pin<Box<dyn Stream<Item = Result<InvokeResponse, Status>> + Send + Sync + 'static>>;
