@@ -8,18 +8,18 @@ use tonic::{Request, Response, Status, async_trait};
 
 use crate::{MethodRegistry, RpcError};
 
-/// Protocol buffer definitions for the InvokePlane gRPC service.
+/// Protocol buffer definitions for the InvokePlaneService gRPC service.
 ///
 /// This module re-exports the generated protobuf types for the gRPC-Mesh RPC protocol.
-/// It includes the `InvokePlane` service definition and associated request/response types.
+/// It includes the `InvokePlaneService` service definition and associated request/response types.
 ///
 /// # Generated Types
 ///
-/// - `InvokeRequest`: Request message for unary and streaming invocations
+/// - `InvokeRequest`: Request message for unary invocations
 /// - `InvokeResponse`: Response message containing results or errors
 /// - `ErrorDetail`: Structured error information
-/// - `InvokePlane`: Service trait for implementing the RPC handler
-/// - `InvokePlaneServer`: Server implementation wrapper
+/// - `InvokePlaneService`: Service trait for implementing the RPC handler
+/// - `InvokePlaneServiceServer`: Server implementation wrapper
 ///
 /// These types are used by both the `InvokeService` implementation and client code
 /// that needs to interact with the mesh protocol.
@@ -38,15 +38,15 @@ pub mod proto {
 }
 
 use proto::grpc_mesh::rpc::v1::{
-    ErrorDetail, InvokeRequest, InvokeResponse,
-    invoke_plane_server::{InvokePlane, InvokePlaneServer},
+    ErrorDetail, InvokeRequest, InvokeResponse, InvokeStreamRequest, InvokeStreamResponse,
+    invoke_plane_service_server::{InvokePlaneService, InvokePlaneServiceServer},
 };
 
 const STREAM_BUFFER: usize = 16;
 
 /// gRPC service implementation that dispatches RPC invocations to local method handlers.
 ///
-/// `InvokeService` implements the `InvokePlane` gRPC service by routing incoming
+/// `InvokeService` implements the `InvokePlaneService` gRPC service by routing incoming
 /// requests to the appropriate handlers registered in a [`MethodRegistry`]. It provides:
 /// - Unary RPC support via `Invoke`
 /// - Bidirectional streaming via `InvokeStream`
@@ -113,7 +113,7 @@ impl InvokeService {
     /// Converts this service into a tonic server implementation.
     ///
     /// This is a convenience method that wraps the service in tonic's
-    /// `InvokePlaneServer` wrapper, making it ready to be added to a
+    /// `InvokePlaneServiceServer` wrapper, making it ready to be added to a
     /// `tonic::transport::Server`.
     ///
     /// # Returns
@@ -136,13 +136,13 @@ impl InvokeService {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn into_server(self) -> InvokePlaneServer<Self> {
-        InvokePlaneServer::new(self)
+    pub fn into_server(self) -> InvokePlaneServiceServer<Self> {
+        InvokePlaneServiceServer::new(self)
     }
 }
 
 #[async_trait]
-impl InvokePlane for InvokeService {
+impl InvokePlaneService for InvokeService {
     /// Handles unary RPC invocations.
     ///
     /// This method:
@@ -161,12 +161,12 @@ impl InvokePlane for InvokeService {
         Ok(Response::new(response))
     }
 
-    type InvokeStreamStream = ReceiverStream<Result<InvokeResponse, Status>>;
+    type InvokeStreamStream = ReceiverStream<Result<InvokeStreamResponse, Status>>;
 
     /// Handles bidirectional streaming RPC invocations.
     ///
     /// This method creates a bidirectional stream where:
-    /// - The client can send multiple InvokeRequest messages
+    /// - The client can send multiple InvokeStreamRequest messages
     /// - Each request is processed independently and its response is sent back
     /// - The stream remains open until the client closes it or an error occurs
     ///
@@ -174,8 +174,8 @@ impl InvokePlane for InvokeService {
     /// requests from the inbound stream and sends responses to the outbound stream.
     async fn invoke_stream(
         &self,
-        request: Request<tonic::Streaming<InvokeRequest>>,
-    ) -> Result<Response<<Self as InvokePlane>::InvokeStreamStream>, Status> {
+        request: Request<tonic::Streaming<InvokeStreamRequest>>,
+    ) -> Result<Response<<Self as InvokePlaneService>::InvokeStreamStream>, Status> {
         let mut inbound = request.into_inner();
         let registry = self.registry.clone();
         let (tx, rx) = mpsc::channel(STREAM_BUFFER);
@@ -183,9 +183,33 @@ impl InvokePlane for InvokeService {
         tokio::spawn(async move {
             while let Some(next) = inbound.message().await.transpose() {
                 match next {
-                    Ok(msg) => {
-                        let result = execute_request(&registry, msg).await;
-                        if tx.send(result).await.is_err() {
+                    Ok(req) => {
+                        // Convert InvokeStreamRequest to InvokeRequest
+                        let invoke_req = InvokeRequest {
+                            peer_id: req.peer_id,
+                            method: req.method,
+                            payload: req.payload,
+                            correlation_id: req.correlation_id,
+                            timeout_ms: req.timeout_ms,
+                        };
+
+                        let result = execute_request(&registry, invoke_req).await;
+
+                        // Convert InvokeResponse to InvokeStreamResponse
+                        let stream_resp = match result {
+                            Ok(resp) => Ok(InvokeStreamResponse {
+                                peer_id: resp.peer_id,
+                                method: resp.method,
+                                result: resp.result,
+                                success: resp.success,
+                                error: resp.error,
+                                correlation_id: resp.correlation_id,
+                                elapsed_ms: resp.elapsed_ms,
+                            }),
+                            Err(e) => Err(e),
+                        };
+
+                        if tx.send(stream_resp).await.is_err() {
                             break;
                         }
                     }
@@ -293,7 +317,7 @@ fn to_error_detail(err: RpcError) -> ErrorDetail {
 /// suitable for use in async contexts. It's primarily used for advanced
 /// streaming scenarios where the concrete stream type needs to be erased.
 ///
-/// Most users should use the `InvokeStreamStream` type from the `InvokePlane`
+/// Most users should use the `InvokeStreamStream` type from the `InvokePlaneService`
 /// trait implementation instead.
 pub type InvokeStream =
-    Pin<Box<dyn Stream<Item = Result<InvokeResponse, Status>> + Send + Sync + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<InvokeStreamResponse, Status>> + Send + Sync + 'static>>;

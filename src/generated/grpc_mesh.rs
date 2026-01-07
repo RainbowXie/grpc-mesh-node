@@ -14,9 +14,15 @@ pub struct PeerMetadata {
         ::prost::alloc::string::String,
     >,
 }
-/// RegisterAck acknowledges peer registration.
+/// RegisterPeerRequest wraps the metadata for registration.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterPeerRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<PeerMetadata>,
+}
+/// RegisterPeerResponse acknowledges peer registration.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RegisterAck {
+pub struct RegisterPeerResponse {
     #[prost(bool, tag = "1")]
     pub accepted: bool,
     #[prost(string, tag = "2")]
@@ -98,6 +104,38 @@ pub struct InvokeResponse {
     #[prost(uint64, tag = "7")]
     pub elapsed_ms: u64,
 }
+/// InvokeStreamRequest is the request type for the InvokeStream RPC.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InvokeStreamRequest {
+    #[prost(string, tag = "1")]
+    pub peer_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub payload: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub correlation_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "5")]
+    pub timeout_ms: u32,
+}
+/// InvokeStreamResponse is the response type for the InvokeStream RPC.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InvokeStreamResponse {
+    #[prost(string, tag = "1")]
+    pub peer_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub result: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bool, tag = "4")]
+    pub success: bool,
+    #[prost(message, optional, tag = "5")]
+    pub error: ::core::option::Option<ErrorDetail>,
+    #[prost(string, tag = "6")]
+    pub correlation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub elapsed_ms: u64,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorDetail {
     #[prost(string, tag = "1")]
@@ -108,7 +146,7 @@ pub struct ErrorDetail {
     pub details: ::prost::alloc::vec::Vec<u8>,
 }
 /// Generated client implementations.
-pub mod control_plane_client {
+pub mod control_plane_service_client {
     #![allow(
         unused_variables,
         dead_code,
@@ -118,12 +156,12 @@ pub mod control_plane_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// ControlPlane handles peer lifecycle.
+    /// ControlPlaneService handles peer lifecycle.
     #[derive(Debug, Clone)]
-    pub struct ControlPlaneClient<T> {
+    pub struct ControlPlaneServiceClient<T> {
         inner: tonic::client::Grpc<T>,
     }
-    impl ControlPlaneClient<tonic::transport::Channel> {
+    impl ControlPlaneServiceClient<tonic::transport::Channel> {
         /// Attempt to create a new client by connecting to a given endpoint.
         pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
         where
@@ -134,7 +172,7 @@ pub mod control_plane_client {
             Ok(Self::new(conn))
         }
     }
-    impl<T> ControlPlaneClient<T>
+    impl<T> ControlPlaneServiceClient<T>
     where
         T: tonic::client::GrpcService<tonic::body::Body>,
         T::Error: Into<StdError>,
@@ -152,7 +190,7 @@ pub mod control_plane_client {
         pub fn with_interceptor<F>(
             inner: T,
             interceptor: F,
-        ) -> ControlPlaneClient<InterceptedService<T, F>>
+        ) -> ControlPlaneServiceClient<InterceptedService<T, F>>
         where
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
@@ -166,7 +204,7 @@ pub mod control_plane_client {
                 http::Request<tonic::body::Body>,
             >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            ControlPlaneClient::new(InterceptedService::new(inner, interceptor))
+            ControlPlaneServiceClient::new(InterceptedService::new(inner, interceptor))
         }
         /// Compress requests with the given encoding.
         ///
@@ -201,8 +239,11 @@ pub mod control_plane_client {
         }
         pub async fn register_peer(
             &mut self,
-            request: impl tonic::IntoRequest<super::PeerMetadata>,
-        ) -> std::result::Result<tonic::Response<super::RegisterAck>, tonic::Status> {
+            request: impl tonic::IntoRequest<super::RegisterPeerRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterPeerResponse>,
+            tonic::Status,
+        > {
             self.inner
                 .ready()
                 .await
@@ -213,12 +254,15 @@ pub mod control_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/grpc_mesh.rpc.v1.ControlPlane/RegisterPeer",
+                "/grpc_mesh.rpc.v1.ControlPlaneService/RegisterPeer",
             );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(
-                    GrpcMethod::new("grpc_mesh.rpc.v1.ControlPlane", "RegisterPeer"),
+                    GrpcMethod::new(
+                        "grpc_mesh.rpc.v1.ControlPlaneService",
+                        "RegisterPeer",
+                    ),
                 );
             self.inner.unary(req, path, codec).await
         }
@@ -239,11 +283,13 @@ pub mod control_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/grpc_mesh.rpc.v1.ControlPlane/Heartbeat",
+                "/grpc_mesh.rpc.v1.ControlPlaneService/Heartbeat",
             );
             let mut req = request.into_streaming_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("grpc_mesh.rpc.v1.ControlPlane", "Heartbeat"));
+                .insert(
+                    GrpcMethod::new("grpc_mesh.rpc.v1.ControlPlaneService", "Heartbeat"),
+                );
             self.inner.streaming(req, path, codec).await
         }
         pub async fn update_methods(
@@ -263,19 +309,22 @@ pub mod control_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/grpc_mesh.rpc.v1.ControlPlane/UpdateMethods",
+                "/grpc_mesh.rpc.v1.ControlPlaneService/UpdateMethods",
             );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(
-                    GrpcMethod::new("grpc_mesh.rpc.v1.ControlPlane", "UpdateMethods"),
+                    GrpcMethod::new(
+                        "grpc_mesh.rpc.v1.ControlPlaneService",
+                        "UpdateMethods",
+                    ),
                 );
             self.inner.unary(req, path, codec).await
         }
     }
 }
 /// Generated server implementations.
-pub mod control_plane_server {
+pub mod control_plane_service_server {
     #![allow(
         unused_variables,
         dead_code,
@@ -284,13 +333,16 @@ pub mod control_plane_server {
         clippy::let_unit_value,
     )]
     use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with ControlPlaneServer.
+    /// Generated trait containing gRPC methods that should be implemented for use with ControlPlaneServiceServer.
     #[async_trait]
-    pub trait ControlPlane: std::marker::Send + std::marker::Sync + 'static {
+    pub trait ControlPlaneService: std::marker::Send + std::marker::Sync + 'static {
         async fn register_peer(
             &self,
-            request: tonic::Request<super::PeerMetadata>,
-        ) -> std::result::Result<tonic::Response<super::RegisterAck>, tonic::Status>;
+            request: tonic::Request<super::RegisterPeerRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterPeerResponse>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the Heartbeat method.
         type HeartbeatStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::HeartbeatResponse, tonic::Status>,
@@ -309,16 +361,16 @@ pub mod control_plane_server {
             tonic::Status,
         >;
     }
-    /// ControlPlane handles peer lifecycle.
+    /// ControlPlaneService handles peer lifecycle.
     #[derive(Debug)]
-    pub struct ControlPlaneServer<T> {
+    pub struct ControlPlaneServiceServer<T> {
         inner: Arc<T>,
         accept_compression_encodings: EnabledCompressionEncodings,
         send_compression_encodings: EnabledCompressionEncodings,
         max_decoding_message_size: Option<usize>,
         max_encoding_message_size: Option<usize>,
     }
-    impl<T> ControlPlaneServer<T> {
+    impl<T> ControlPlaneServiceServer<T> {
         pub fn new(inner: T) -> Self {
             Self::from_arc(Arc::new(inner))
         }
@@ -369,9 +421,9 @@ pub mod control_plane_server {
             self
         }
     }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for ControlPlaneServer<T>
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for ControlPlaneServiceServer<T>
     where
-        T: ControlPlane,
+        T: ControlPlaneService,
         B: Body + std::marker::Send + 'static,
         B::Error: Into<StdError> + std::marker::Send + 'static,
     {
@@ -386,25 +438,26 @@ pub mod control_plane_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/grpc_mesh.rpc.v1.ControlPlane/RegisterPeer" => {
+                "/grpc_mesh.rpc.v1.ControlPlaneService/RegisterPeer" => {
                     #[allow(non_camel_case_types)]
-                    struct RegisterPeerSvc<T: ControlPlane>(pub Arc<T>);
+                    struct RegisterPeerSvc<T: ControlPlaneService>(pub Arc<T>);
                     impl<
-                        T: ControlPlane,
-                    > tonic::server::UnaryService<super::PeerMetadata>
+                        T: ControlPlaneService,
+                    > tonic::server::UnaryService<super::RegisterPeerRequest>
                     for RegisterPeerSvc<T> {
-                        type Response = super::RegisterAck;
+                        type Response = super::RegisterPeerResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
                         >;
                         fn call(
                             &mut self,
-                            request: tonic::Request<super::PeerMetadata>,
+                            request: tonic::Request<super::RegisterPeerRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ControlPlane>::register_peer(&inner, request).await
+                                <T as ControlPlaneService>::register_peer(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -431,11 +484,11 @@ pub mod control_plane_server {
                     };
                     Box::pin(fut)
                 }
-                "/grpc_mesh.rpc.v1.ControlPlane/Heartbeat" => {
+                "/grpc_mesh.rpc.v1.ControlPlaneService/Heartbeat" => {
                     #[allow(non_camel_case_types)]
-                    struct HeartbeatSvc<T: ControlPlane>(pub Arc<T>);
+                    struct HeartbeatSvc<T: ControlPlaneService>(pub Arc<T>);
                     impl<
-                        T: ControlPlane,
+                        T: ControlPlaneService,
                     > tonic::server::StreamingService<super::HeartbeatRequest>
                     for HeartbeatSvc<T> {
                         type Response = super::HeartbeatResponse;
@@ -452,7 +505,7 @@ pub mod control_plane_server {
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ControlPlane>::heartbeat(&inner, request).await
+                                <T as ControlPlaneService>::heartbeat(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -479,11 +532,11 @@ pub mod control_plane_server {
                     };
                     Box::pin(fut)
                 }
-                "/grpc_mesh.rpc.v1.ControlPlane/UpdateMethods" => {
+                "/grpc_mesh.rpc.v1.ControlPlaneService/UpdateMethods" => {
                     #[allow(non_camel_case_types)]
-                    struct UpdateMethodsSvc<T: ControlPlane>(pub Arc<T>);
+                    struct UpdateMethodsSvc<T: ControlPlaneService>(pub Arc<T>);
                     impl<
-                        T: ControlPlane,
+                        T: ControlPlaneService,
                     > tonic::server::UnaryService<super::UpdateMethodsRequest>
                     for UpdateMethodsSvc<T> {
                         type Response = super::UpdateMethodsResponse;
@@ -497,7 +550,8 @@ pub mod control_plane_server {
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ControlPlane>::update_methods(&inner, request).await
+                                <T as ControlPlaneService>::update_methods(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -546,7 +600,7 @@ pub mod control_plane_server {
             }
         }
     }
-    impl<T> Clone for ControlPlaneServer<T> {
+    impl<T> Clone for ControlPlaneServiceServer<T> {
         fn clone(&self) -> Self {
             let inner = self.inner.clone();
             Self {
@@ -559,13 +613,13 @@ pub mod control_plane_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "grpc_mesh.rpc.v1.ControlPlane";
-    impl<T> tonic::server::NamedService for ControlPlaneServer<T> {
+    pub const SERVICE_NAME: &str = "grpc_mesh.rpc.v1.ControlPlaneService";
+    impl<T> tonic::server::NamedService for ControlPlaneServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
 /// Generated client implementations.
-pub mod invoke_plane_client {
+pub mod invoke_plane_service_client {
     #![allow(
         unused_variables,
         dead_code,
@@ -575,12 +629,12 @@ pub mod invoke_plane_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// InvokePlane handles reverse RPC invocations.
+    /// InvokePlaneService handles reverse RPC invocations.
     #[derive(Debug, Clone)]
-    pub struct InvokePlaneClient<T> {
+    pub struct InvokePlaneServiceClient<T> {
         inner: tonic::client::Grpc<T>,
     }
-    impl InvokePlaneClient<tonic::transport::Channel> {
+    impl InvokePlaneServiceClient<tonic::transport::Channel> {
         /// Attempt to create a new client by connecting to a given endpoint.
         pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
         where
@@ -591,7 +645,7 @@ pub mod invoke_plane_client {
             Ok(Self::new(conn))
         }
     }
-    impl<T> InvokePlaneClient<T>
+    impl<T> InvokePlaneServiceClient<T>
     where
         T: tonic::client::GrpcService<tonic::body::Body>,
         T::Error: Into<StdError>,
@@ -609,7 +663,7 @@ pub mod invoke_plane_client {
         pub fn with_interceptor<F>(
             inner: T,
             interceptor: F,
-        ) -> InvokePlaneClient<InterceptedService<T, F>>
+        ) -> InvokePlaneServiceClient<InterceptedService<T, F>>
         where
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
@@ -623,7 +677,7 @@ pub mod invoke_plane_client {
                 http::Request<tonic::body::Body>,
             >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            InvokePlaneClient::new(InterceptedService::new(inner, interceptor))
+            InvokePlaneServiceClient::new(InterceptedService::new(inner, interceptor))
         }
         /// Compress requests with the given encoding.
         ///
@@ -670,18 +724,22 @@ pub mod invoke_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/grpc_mesh.rpc.v1.InvokePlane/Invoke",
+                "/grpc_mesh.rpc.v1.InvokePlaneService/Invoke",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("grpc_mesh.rpc.v1.InvokePlane", "Invoke"));
+                .insert(
+                    GrpcMethod::new("grpc_mesh.rpc.v1.InvokePlaneService", "Invoke"),
+                );
             self.inner.unary(req, path, codec).await
         }
         pub async fn invoke_stream(
             &mut self,
-            request: impl tonic::IntoStreamingRequest<Message = super::InvokeRequest>,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::InvokeStreamRequest,
+            >,
         ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::InvokeResponse>>,
+            tonic::Response<tonic::codec::Streaming<super::InvokeStreamResponse>>,
             tonic::Status,
         > {
             self.inner
@@ -694,17 +752,22 @@ pub mod invoke_plane_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/grpc_mesh.rpc.v1.InvokePlane/InvokeStream",
+                "/grpc_mesh.rpc.v1.InvokePlaneService/InvokeStream",
             );
             let mut req = request.into_streaming_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("grpc_mesh.rpc.v1.InvokePlane", "InvokeStream"));
+                .insert(
+                    GrpcMethod::new(
+                        "grpc_mesh.rpc.v1.InvokePlaneService",
+                        "InvokeStream",
+                    ),
+                );
             self.inner.streaming(req, path, codec).await
         }
     }
 }
 /// Generated server implementations.
-pub mod invoke_plane_server {
+pub mod invoke_plane_service_server {
     #![allow(
         unused_variables,
         dead_code,
@@ -713,37 +776,37 @@ pub mod invoke_plane_server {
         clippy::let_unit_value,
     )]
     use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with InvokePlaneServer.
+    /// Generated trait containing gRPC methods that should be implemented for use with InvokePlaneServiceServer.
     #[async_trait]
-    pub trait InvokePlane: std::marker::Send + std::marker::Sync + 'static {
+    pub trait InvokePlaneService: std::marker::Send + std::marker::Sync + 'static {
         async fn invoke(
             &self,
             request: tonic::Request<super::InvokeRequest>,
         ) -> std::result::Result<tonic::Response<super::InvokeResponse>, tonic::Status>;
         /// Server streaming response type for the InvokeStream method.
         type InvokeStreamStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::InvokeResponse, tonic::Status>,
+                Item = std::result::Result<super::InvokeStreamResponse, tonic::Status>,
             >
             + std::marker::Send
             + 'static;
         async fn invoke_stream(
             &self,
-            request: tonic::Request<tonic::Streaming<super::InvokeRequest>>,
+            request: tonic::Request<tonic::Streaming<super::InvokeStreamRequest>>,
         ) -> std::result::Result<
             tonic::Response<Self::InvokeStreamStream>,
             tonic::Status,
         >;
     }
-    /// InvokePlane handles reverse RPC invocations.
+    /// InvokePlaneService handles reverse RPC invocations.
     #[derive(Debug)]
-    pub struct InvokePlaneServer<T> {
+    pub struct InvokePlaneServiceServer<T> {
         inner: Arc<T>,
         accept_compression_encodings: EnabledCompressionEncodings,
         send_compression_encodings: EnabledCompressionEncodings,
         max_decoding_message_size: Option<usize>,
         max_encoding_message_size: Option<usize>,
     }
-    impl<T> InvokePlaneServer<T> {
+    impl<T> InvokePlaneServiceServer<T> {
         pub fn new(inner: T) -> Self {
             Self::from_arc(Arc::new(inner))
         }
@@ -794,9 +857,9 @@ pub mod invoke_plane_server {
             self
         }
     }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for InvokePlaneServer<T>
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for InvokePlaneServiceServer<T>
     where
-        T: InvokePlane,
+        T: InvokePlaneService,
         B: Body + std::marker::Send + 'static,
         B::Error: Into<StdError> + std::marker::Send + 'static,
     {
@@ -811,11 +874,11 @@ pub mod invoke_plane_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/grpc_mesh.rpc.v1.InvokePlane/Invoke" => {
+                "/grpc_mesh.rpc.v1.InvokePlaneService/Invoke" => {
                     #[allow(non_camel_case_types)]
-                    struct InvokeSvc<T: InvokePlane>(pub Arc<T>);
+                    struct InvokeSvc<T: InvokePlaneService>(pub Arc<T>);
                     impl<
-                        T: InvokePlane,
+                        T: InvokePlaneService,
                     > tonic::server::UnaryService<super::InvokeRequest>
                     for InvokeSvc<T> {
                         type Response = super::InvokeResponse;
@@ -829,7 +892,7 @@ pub mod invoke_plane_server {
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as InvokePlane>::invoke(&inner, request).await
+                                <T as InvokePlaneService>::invoke(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -856,14 +919,14 @@ pub mod invoke_plane_server {
                     };
                     Box::pin(fut)
                 }
-                "/grpc_mesh.rpc.v1.InvokePlane/InvokeStream" => {
+                "/grpc_mesh.rpc.v1.InvokePlaneService/InvokeStream" => {
                     #[allow(non_camel_case_types)]
-                    struct InvokeStreamSvc<T: InvokePlane>(pub Arc<T>);
+                    struct InvokeStreamSvc<T: InvokePlaneService>(pub Arc<T>);
                     impl<
-                        T: InvokePlane,
-                    > tonic::server::StreamingService<super::InvokeRequest>
+                        T: InvokePlaneService,
+                    > tonic::server::StreamingService<super::InvokeStreamRequest>
                     for InvokeStreamSvc<T> {
-                        type Response = super::InvokeResponse;
+                        type Response = super::InvokeStreamResponse;
                         type ResponseStream = T::InvokeStreamStream;
                         type Future = BoxFuture<
                             tonic::Response<Self::ResponseStream>,
@@ -872,12 +935,13 @@ pub mod invoke_plane_server {
                         fn call(
                             &mut self,
                             request: tonic::Request<
-                                tonic::Streaming<super::InvokeRequest>,
+                                tonic::Streaming<super::InvokeStreamRequest>,
                             >,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as InvokePlane>::invoke_stream(&inner, request).await
+                                <T as InvokePlaneService>::invoke_stream(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -926,7 +990,7 @@ pub mod invoke_plane_server {
             }
         }
     }
-    impl<T> Clone for InvokePlaneServer<T> {
+    impl<T> Clone for InvokePlaneServiceServer<T> {
         fn clone(&self) -> Self {
             let inner = self.inner.clone();
             Self {
@@ -939,8 +1003,8 @@ pub mod invoke_plane_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "grpc_mesh.rpc.v1.InvokePlane";
-    impl<T> tonic::server::NamedService for InvokePlaneServer<T> {
+    pub const SERVICE_NAME: &str = "grpc_mesh.rpc.v1.InvokePlaneService";
+    impl<T> tonic::server::NamedService for InvokePlaneServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
