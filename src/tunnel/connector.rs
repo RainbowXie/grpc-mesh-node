@@ -8,7 +8,13 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{interval, sleep, timeout};
 use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use tokio_util::compat::{FuturesAsyncWriteCompatExt, TokioAsyncReadCompatExt};
 use webpki_roots::TLS_SERVER_ROOTS;
 use yamux::{Config as YamuxConfig, Connection, Mode, Stream};
@@ -88,6 +94,13 @@ pub struct ConnectorConfig {
     ///
     /// Default: 15 seconds
     pub heartbeat_interval: Duration,
+
+    /// Skip TLS certificate verification entirely.
+    ///
+    /// This is intended only for controlled development scenarios where the server
+    /// rotates self-signed certificates dynamically and the client cannot preload
+    /// the active CA bundle.
+    pub insecure_skip_verify: bool,
 }
 
 impl Default for ConnectorConfig {
@@ -99,7 +112,56 @@ impl Default for ConnectorConfig {
             connect_timeout: Duration::from_secs(10),
             max_backoff: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(15),
+            insecure_skip_verify: false,
         }
+    }
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
     }
 }
 
@@ -612,6 +674,14 @@ impl TunnelConnector {
 /// - `Ok(ClientConfig)`: Ready-to-use TLS configuration
 /// - `Err(TunnelError)`: If CA certificates are invalid or cannot be parsed
 fn build_tls_config(cfg: &ConnectorConfig) -> Result<ClientConfig> {
+    if cfg.insecure_skip_verify {
+        tracing::warn!("TLS certificate verification is disabled for this connector");
+        return Ok(ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth());
+    }
+
     let mut roots = RootCertStore::empty();
 
     // If custom CA certs are provided, use only those (don't include system roots)

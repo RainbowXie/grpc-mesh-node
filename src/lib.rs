@@ -85,7 +85,7 @@
 pub mod rpc;
 pub mod tunnel;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -320,6 +320,7 @@ pub struct RpcResponse {
 /// });
 /// ```
 pub type MethodHandler = Arc<dyn Fn(Vec<u8>) -> RpcResult<Vec<u8>> + Send + Sync>;
+pub type MethodHandlerWithRequest = Arc<dyn Fn(RpcRequest) -> RpcResult<Vec<u8>> + Send + Sync>;
 
 /// Thread-safe registry for storing and dispatching RPC method handlers.
 ///
@@ -362,6 +363,7 @@ pub type MethodHandler = Arc<dyn Fn(Vec<u8>) -> RpcResult<Vec<u8>> + Send + Sync
 #[derive(Default, Clone)]
 pub struct MethodRegistry {
     inner: Arc<RwLock<HashMap<String, MethodHandler>>>,
+    inner_with_request: Arc<RwLock<HashMap<String, MethodHandlerWithRequest>>>,
 }
 
 impl MethodRegistry {
@@ -403,6 +405,18 @@ impl MethodRegistry {
             .insert(method.into(), handler);
     }
 
+    /// Registers a method handler that receives the full [`RpcRequest`].
+    pub fn register_with_request<S: Into<String>>(
+        &self,
+        method: S,
+        handler: MethodHandlerWithRequest,
+    ) {
+        self.inner_with_request
+            .write()
+            .expect("registry poisoned")
+            .insert(method.into(), handler);
+    }
+
     /// Removes a method handler from the registry.
     ///
     /// After calling this method, invocations of the specified method will fail
@@ -434,6 +448,10 @@ impl MethodRegistry {
     /// ```
     pub fn unregister<S: AsRef<str>>(&self, method: S) {
         self.inner
+            .write()
+            .expect("registry poisoned")
+            .remove(method.as_ref());
+        self.inner_with_request
             .write()
             .expect("registry poisoned")
             .remove(method.as_ref());
@@ -475,6 +493,21 @@ impl MethodRegistry {
     /// assert!(matches!(not_found, Err(RpcError::MethodNotFound(_))));
     /// ```
     pub fn invoke(&self, method: &str, payload: Vec<u8>) -> RpcResult<Vec<u8>> {
+        if let Some(handler) = self
+            .inner_with_request
+            .read()
+            .expect("registry poisoned")
+            .get(method)
+            .cloned()
+        {
+            return handler(RpcRequest {
+                method: method.to_owned(),
+                payload,
+                timeout: std::time::Duration::from_secs(0),
+                correlation_id: String::new(),
+            });
+        }
+
         let handler = self
             .inner
             .read()
@@ -484,6 +517,21 @@ impl MethodRegistry {
             .ok_or_else(|| RpcError::MethodNotFound(method.to_owned()))?;
 
         handler(payload)
+    }
+
+    /// Invokes a registered method handler with the full [`RpcRequest`].
+    pub fn invoke_request(&self, request: RpcRequest) -> RpcResult<Vec<u8>> {
+        if let Some(handler) = self
+            .inner_with_request
+            .read()
+            .expect("registry poisoned")
+            .get(request.method.as_str())
+            .cloned()
+        {
+            return handler(request);
+        }
+
+        self.invoke(&request.method, request.payload)
     }
 
     /// Returns a list of all currently registered method names.
@@ -519,12 +567,21 @@ impl MethodRegistry {
     /// assert!(methods.contains(&"service.method2".to_string()));
     /// ```
     pub fn methods(&self) -> Vec<String> {
-        self.inner
+        let mut methods: HashSet<String> = self
+            .inner
             .read()
             .expect("registry poisoned")
             .keys()
             .cloned()
-            .collect()
+            .collect();
+        methods.extend(
+            self.inner_with_request
+                .read()
+                .expect("registry poisoned")
+                .keys()
+                .cloned(),
+        );
+        methods.into_iter().collect()
     }
 }
 

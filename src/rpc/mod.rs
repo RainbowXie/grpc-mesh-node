@@ -256,7 +256,7 @@ async fn execute_request(
         method,
         payload,
         correlation_id,
-        timeout_ms: _,
+        timeout_ms,
     } = request;
 
     if method.trim().is_empty() {
@@ -264,7 +264,12 @@ async fn execute_request(
     }
 
     let started = Instant::now();
-    let result = registry.invoke(&method, payload);
+    let result = registry.invoke_request(crate::RpcRequest {
+        method: method.clone(),
+        payload,
+        timeout: std::time::Duration::from_millis(timeout_ms as u64),
+        correlation_id: correlation_id.clone(),
+    });
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     let (success, result_payload, error) = match result {
