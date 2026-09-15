@@ -142,36 +142,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting reverse gateway with embedded config"
     );
     let handshake = cfg.build_handshake()?;
-    let registry = setup_registry();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(ctrl_c_listener(shutdown_tx.clone()));
 
     let mut connector = TunnelConnector::new(cfg.connector_config()?, shutdown_rx.clone())?;
-    let incoming = connector.connect_with_backoff(handshake.clone()).await?;
-    info!(
-        target = "reverse-gateway",
-        node_id = handshake.node_id,
-        version = handshake.version,
-        "Tunnel established with automatic heartbeat"
-    );
 
-    let grpc = Server::builder()
-        .add_service(InvokeService::new(registry).into_server())
-        .serve_with_incoming(incoming);
+    // Tunnel supervision: an established tunnel that drops or wedges is
+    // reconnected with backoff instead of exiting. `tunnel_dead` is flagged by
+    // the heartbeat task when its writes stall or fail — covering peers that
+    // vanish without a FIN, where serving would otherwise wait forever.
+    let (tunnel_dead_tx, tunnel_dead_rx) = watch::channel(false);
+    let mut reconnect_attempt: u32 = 0;
 
-    select! {
-        result = grpc => {
-            if let Err(err) = result {
-                error!(target = "reverse-gateway", %err, "gRPC server terminated with error");
-                return Err(err.into());
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        tunnel_dead_tx.send_replace(false);
+        let connected_at = std::time::Instant::now();
+
+        let incoming = match connector
+            .connect_with_backoff_watched(handshake.clone(), tunnel_dead_tx.clone())
+            .await
+        {
+            Ok(incoming) => incoming,
+            Err(grpc_mesh::tunnel::TunnelError::Shutdown) => break,
+            Err(err) => return Err(err.into()),
+        };
+        info!(
+            target = "reverse-gateway",
+            node_id = %handshake.node_id,
+            version = %handshake.version,
+            "Tunnel established with automatic heartbeat"
+        );
+
+        // Handlers registered by setup_registry are stateless, so a fresh
+        // registry per connection is equivalent to reusing one.
+        let grpc = Server::builder()
+            .add_service(InvokeService::new(setup_registry()).into_server())
+            .serve_with_incoming_shutdown(incoming, shutdown_rx_changed(shutdown_rx.clone()));
+
+        select! {
+            result = grpc => match result {
+                Ok(()) => warn!(target = "reverse-gateway", "tunnel ended; reconnecting"),
+                Err(err) => {
+                    warn!(target = "reverse-gateway", %err, "gRPC serving over tunnel failed; reconnecting")
+                }
+            },
+            _ = wait_tunnel_dead(tunnel_dead_rx.clone()) => {
+                warn!(
+                    target = "reverse-gateway",
+                    "heartbeat writes stalled; tunnel presumed dead, reconnecting"
+                );
             }
         }
-        _ = shutdown_rx_changed(shutdown_rx.clone()) => {
-            info!(target = "reverse-gateway", "Shutdown signal received");
+
+        // Connections that die quickly escalate backoff (a broken peer must
+        // not cause a hot reconnect loop); a healthy stretch resets it.
+        reconnect_attempt = if connected_at.elapsed() >= std::time::Duration::from_secs(60) {
+            0
+        } else {
+            reconnect_attempt.saturating_add(1)
+        };
+        let delay = reconnect_delay(reconnect_attempt);
+        info!(
+            target = "reverse-gateway",
+            ?delay,
+            attempt = reconnect_attempt,
+            "waiting before reconnecting"
+        );
+        select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown_rx_changed(shutdown_rx.clone()) => break,
         }
     }
 
+    info!(target = "reverse-gateway", "Gateway shut down cleanly");
     Ok(())
 }
 
@@ -229,6 +276,23 @@ async fn shutdown_rx_changed(mut rx: watch::Receiver<bool>) {
             break;
         }
     }
+}
+
+/// Resolves once the heartbeat task flags the tunnel as dead.
+async fn wait_tunnel_dead(mut rx: watch::Receiver<bool>) {
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            break;
+        }
+    }
+}
+
+/// Reconnect pacing for tunnels that die quickly, capped like the
+/// connector's own connect backoff (250ms base, 30s ceiling).
+fn reconnect_delay(attempt: u32) -> std::time::Duration {
+    let capped = attempt.min(6);
+    let millis = 250u64.saturating_mul(1 << capped);
+    std::time::Duration::from_millis(millis).min(std::time::Duration::from_secs(30))
 }
 
 #[derive(Debug, Clone)]
@@ -320,12 +384,29 @@ impl GatewayConfig {
     }
 
     fn connector_config(&self) -> Result<ConnectorConfig, ConfigError> {
-        let ca_certs = if let Some(path) = &self.ca_bundle_path {
-            load_pem(path)?
+        // Pass PEM bytes through untouched: ConnectorConfig.ca_certs is
+        // documented as PEM and the connector owns parsing. The previous
+        // code pre-parsed to DER here, which the connector then re-parsed
+        // as PEM — silently yielding an empty trust store, so custom CAs
+        // never verified and self-signed servers retried forever.
+        let ca_certs: Vec<Vec<u8>> = if let Some(path) = &self.ca_bundle_path {
+            vec![std::fs::read(path).map_err(|err| ConfigError::Io {
+                path: path.clone(),
+                err,
+            })?]
         } else {
-            // Use embedded CA certificate
-            load_pem_from_string(EMBEDDED_CA_CERT)?
+            vec![EMBEDDED_CA_CERT.as_bytes().to_vec()]
         };
+
+        // Fail fast on material that cannot yield a certificate.
+        for pem in &ca_certs {
+            let mut cursor = std::io::Cursor::new(pem);
+            let parsed_any = rustls_pemfile::certs(&mut cursor)
+                .any(|cert| cert.is_ok());
+            if !parsed_any {
+                return Err(ConfigError::InvalidCa("<configured CA bundle>".into()));
+            }
+        }
 
         Ok(ConnectorConfig {
             server_addr: self.server_addr.clone(),
@@ -360,26 +441,6 @@ fn generate_node_id() -> String {
     let uuid_short = format!("{}", uuid).chars().take(8).collect::<String>();
 
     format!("{}-{}", sanitized_hostname, uuid_short)
-}
-
-fn load_pem(path: &str) -> Result<Vec<Vec<u8>>, ConfigError> {
-    let data = std::fs::read(std::path::Path::new(path)).map_err(|err| ConfigError::Io {
-        path: path.into(),
-        err,
-    })?;
-    let mut cursor = std::io::Cursor::new(data);
-    let certs = rustls_pemfile::certs(&mut cursor)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ConfigError::InvalidCa(path.into()))?;
-    Ok(certs.into_iter().map(|der| der.as_ref().to_vec()).collect())
-}
-
-fn load_pem_from_string(pem_data: &str) -> Result<Vec<Vec<u8>>, ConfigError> {
-    let mut cursor = std::io::Cursor::new(pem_data.as_bytes());
-    let certs = rustls_pemfile::certs(&mut cursor)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ConfigError::InvalidCa("<embedded>".into()))?;
-    Ok(certs.into_iter().map(|der| der.as_ref().to_vec()).collect())
 }
 
 #[derive(Debug, Error)]
