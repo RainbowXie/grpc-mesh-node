@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tokio::time::{interval, sleep, timeout};
+use tokio::time::{interval, sleep, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -299,12 +299,16 @@ impl Tunnel {
     /// Starts automatic heartbeat sending in the background.
     ///
     /// This method spawns a background task that sends heartbeat messages at the configured
-    /// interval. The heartbeat loop continues until the shutdown signal is received.
+    /// interval. The heartbeat loop continues until the shutdown signal is received, or until
+    /// a heartbeat write fails or stalls past its own interval — in that case the tunnel is
+    /// presumed dead and `tunnel_dead` is flagged so the caller's supervisor can tear the
+    /// connection down and reconnect.
     ///
     /// # Parameters
     ///
     /// - `shutdown_rx`: Watch channel receiver for shutdown coordination
     /// - `heartbeat_interval`: Time between heartbeat messages
+    /// - `tunnel_dead`: Watch channel sender flagged when heartbeat writes can no longer complete
     ///
     /// # Returns
     ///
@@ -316,78 +320,155 @@ impl Tunnel {
     ///
     /// # Note
     ///
-    /// This is called automatically by `TunnelConnector::connect_with_backoff()`.
+    /// This is called automatically by `TunnelConnector::connect_with_backoff_watched()`.
     /// Most applications don't need to call this directly.
     fn start_heartbeat(
         mut self,
         shutdown_rx: watch::Receiver<bool>,
         heartbeat_interval: Duration,
+        tunnel_dead: watch::Sender<bool>,
     ) -> Result<YamuxIncoming> {
         let node_id = self.handshake.node_id.clone();
-        let mut control_stream = self.control_stream;
+        let control_stream = self.control_stream;
         let incoming = self
             .incoming
             .take()
             .ok_or(TunnelError::Protocol("incoming already taken".into()))?;
 
-        tokio::spawn(async move {
-            let mut heartbeat_ticker = interval(heartbeat_interval);
-            let mut sequence = 0u64;
-
-            loop {
-                heartbeat_ticker.tick().await;
-
-                // Check shutdown signal
-                if *shutdown_rx.borrow() {
-                    tracing::info!("💓 Heartbeat loop shutting down");
-                    break;
-                }
-
-                // Build heartbeat message
-                let heartbeat_msg = serde_json::json!({
-                    "type": "heartbeat",
-                    "heartbeat": {
-                        "node_id": node_id,
-                        "timestamp_unix_sec": std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        "sequence": sequence,
-                    }
-                });
-
-                sequence += 1;
-
-                // Serialize to JSON
-                let heartbeat_json = match serde_json::to_vec(&heartbeat_msg) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        tracing::warn!("💔 Failed to serialize heartbeat: {}", e);
-                        continue;
-                    }
-                };
-
-                // Build frame: 4-byte big-endian length prefix + JSON payload
-                let payload_len = heartbeat_json.len() as u32;
-                let mut frame = Vec::with_capacity(4 + heartbeat_json.len());
-                frame.extend_from_slice(&payload_len.to_be_bytes());
-                frame.extend_from_slice(&heartbeat_json);
-
-                // Send heartbeat frame
-                if let Err(e) = control_stream.write_all(&frame).await {
-                    tracing::warn!("💔 Failed to send heartbeat: {}", e);
-                } else {
-                    if let Err(e) = control_stream.flush().await {
-                        tracing::warn!("💔 Failed to flush heartbeat: {}", e);
-                    } else {
-                        tracing::debug!("💓 Heartbeat sent (seq={})", sequence - 1);
-                    }
-                }
-            }
-        });
+        tokio::spawn(run_heartbeat(
+            control_stream,
+            node_id,
+            heartbeat_interval,
+            shutdown_rx,
+            tunnel_dead,
+        ));
 
         Ok(incoming)
     }
+}
+
+/// Sends heartbeat frames on the control stream until shutdown, or until a
+/// write fails or stalls past `heartbeat_interval`.
+///
+/// A heartbeat write that cannot complete within its own interval means the
+/// tunnel is unusable — the peer stopped reading and the yamux send window is
+/// exhausted, or the connection is gone. The loop then closes the stream
+/// (best-effort FIN) and flags `tunnel_dead`; the previous behavior of logging
+/// a warning and looping forever left the task frozen on a wedged connection.
+async fn run_heartbeat<W>(
+    mut writer: W,
+    node_id: String,
+    heartbeat_interval: Duration,
+    shutdown_rx: watch::Receiver<bool>,
+    tunnel_dead: watch::Sender<bool>,
+) where
+    W: futures::io::AsyncWrite + Unpin,
+{
+    let mut heartbeat_ticker = interval(heartbeat_interval);
+    let mut sequence = 0u64;
+
+    loop {
+        heartbeat_ticker.tick().await;
+
+        // Check shutdown signal
+        if *shutdown_rx.borrow() {
+            tracing::info!("💓 Heartbeat loop shutting down");
+            break;
+        }
+
+        // Build heartbeat message
+        let heartbeat_msg = serde_json::json!({
+            "type": "heartbeat",
+            "heartbeat": {
+                "node_id": node_id,
+                "timestamp_unix_sec": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                "sequence": sequence,
+            }
+        });
+
+        sequence += 1;
+
+        // Serialize to JSON
+        let heartbeat_json = match serde_json::to_vec(&heartbeat_msg) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("💔 Failed to serialize heartbeat: {}", e);
+                continue;
+            }
+        };
+
+        // Build frame: 4-byte big-endian length prefix + JSON payload
+        let payload_len = heartbeat_json.len() as u32;
+        let mut frame = Vec::with_capacity(4 + heartbeat_json.len());
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        frame.extend_from_slice(&heartbeat_json);
+
+        // One heartbeat must complete within its own interval on a healthy
+        // tunnel; anything slower is a wedged or dead connection.
+        let write_result = timeout(heartbeat_interval, async {
+            writer.write_all(&frame).await?;
+            writer.flush().await
+        })
+        .await;
+
+        match write_result {
+            Ok(Ok(())) => {
+                tracing::debug!("💓 Heartbeat sent (seq={})", sequence - 1);
+            }
+            Ok(Err(err)) => {
+                tracing::error!(
+                    sequence,
+                    error = %err,
+                    "grpc-mesh heartbeat write failed; tunnel presumed dead"
+                );
+                break;
+            }
+            Err(elapsed) => {
+                tracing::error!(
+                    sequence,
+                    elapsed = ?elapsed,
+                    "grpc-mesh heartbeat write timed out; tunnel presumed dead"
+                );
+                break;
+            }
+        }
+    }
+
+    if !*shutdown_rx.borrow() {
+        // Best-effort FIN so a live server notices immediately; the supervisor
+        // drops the whole connection (and its socket) when it acts on the flag.
+        let _ = timeout(Duration::from_secs(1), writer.close()).await;
+        tunnel_dead.send_replace(true);
+    }
+}
+
+/// Classifies a TLS handshake failure into a retry decision.
+///
+/// tokio-rustls wraps rustls protocol errors in `io::Error`; certificate
+/// rejections, peer alerts and peer misbehavior are configuration problems
+/// (wrong CA, expired cert, SNI mismatch, ...) that retrying cannot fix, so
+/// they surface as terminal `TunnelError::Config` instead of feeding the
+/// connect-retry loop forever. Network-level failures stay retryable.
+fn classify_tls_handshake_error(err: std::io::Error) -> TunnelError {
+    if let Some(rustls_err) = err.get_ref().and_then(|e| e.downcast_ref::<RustlsError>()) {
+        let permanent = matches!(
+            rustls_err,
+            RustlsError::InvalidCertificate(_)
+                | RustlsError::AlertReceived(_)
+                | RustlsError::PeerMisbehaved(_)
+                | RustlsError::General(_)
+        );
+        if permanent {
+            return TunnelError::Config(format!(
+                "TLS handshake rejected: {rustls_err} — check the CA bundle, certificate validity and SNI; not retryable"
+            ));
+        }
+        return TunnelError::Tls(rustls_err.clone());
+    }
+    TunnelError::Network(err)
 }
 
 /// Connection manager that establishes and maintains tunnels to the gRPC-Mesh server.
@@ -537,6 +618,26 @@ impl TunnelConnector {
     /// # }
     /// ```
     pub async fn connect_with_backoff(&mut self, handshake: Handshake) -> Result<YamuxIncoming> {
+        let (tunnel_dead, _dead_rx) = watch::channel(false);
+        self.connect_with_backoff_watched(handshake, tunnel_dead).await
+    }
+
+    /// Establishes a tunnel with automatic retry, and reports tunnel death.
+    ///
+    /// Behaves like [`connect_with_backoff`], but the spawned heartbeat task
+    /// flags the provided `tunnel_dead` watch channel when its writes stall or
+    /// fail after the connection is established. A supervisor that selects on
+    /// the receiver can then drop the tunnel (closing its socket) and
+    /// reconnect; without this, a peer that vanishes without a FIN leaves the
+    /// serving side waiting forever.
+    ///
+    /// The receiver may be dropped; signalling into a dropped watch channel
+    /// is a no-op.
+    pub async fn connect_with_backoff_watched(
+        &mut self,
+        handshake: Handshake,
+        tunnel_dead: watch::Sender<bool>,
+    ) -> Result<YamuxIncoming> {
         let mut attempt: u32 = 0;
 
         loop {
@@ -552,7 +653,7 @@ impl TunnelConnector {
                         "💓 Starting automatic heartbeat (interval: {:?})",
                         heartbeat_interval
                     );
-                    return tunnel.start_heartbeat(shutdown_rx, heartbeat_interval);
+                    return tunnel.start_heartbeat(shutdown_rx, heartbeat_interval, tunnel_dead);
                 }
                 Err(err) if err.is_retryable() => {
                     attempt = attempt.saturating_add(1);
@@ -580,9 +681,17 @@ impl TunnelConnector {
     }
 
     async fn try_connect(&self, handshake: Handshake) -> Result<Tunnel> {
+        // One budget for the whole establishment: TCP + TLS + yamux setup +
+        // handshake frame, as documented on ConnectorConfig::connect_timeout.
+        let connect_deadline = tokio::time::Instant::now()
+            .checked_add(self.cfg.connect_timeout)
+            .ok_or_else(|| {
+                TunnelError::Config("connect_timeout overflowed the clock".to_string())
+            })?;
+
         tracing::debug!("Attempting TCP connection to {}", self.cfg.server_addr);
-        let stream = match timeout(
-            self.cfg.connect_timeout,
+        let stream = match timeout_at(
+            connect_deadline,
             TcpStream::connect(&self.cfg.server_addr),
         )
         .await
@@ -613,18 +722,32 @@ impl TunnelConnector {
         );
 
         tracing::debug!("Starting TLS handshake with SNI: {}", server_name_str);
-        let tls_stream = TlsConnector::from(self.tls.clone())
-            .connect(server_name, stream)
-            .await
-            .map_err(|e| {
+        let tls_stream = match timeout_at(
+            connect_deadline,
+            TlsConnector::from(self.tls.clone()).connect(server_name, stream),
+        )
+        .await
+        {
+            Ok(Ok(tls_stream)) => tls_stream,
+            Ok(Err(err)) => {
                 tracing::error!(
                     server_addr = %self.cfg.server_addr,
                     server_name = %server_name_str,
-                    error = ?e,
+                    error = ?err,
                     "grpc-mesh TLS handshake failed"
                 );
-                e
-            })?;
+                return Err(classify_tls_handshake_error(err));
+            }
+            Err(elapsed) => {
+                tracing::error!(
+                    server_addr = %self.cfg.server_addr,
+                    server_name = %server_name_str,
+                    elapsed = ?elapsed,
+                    "grpc-mesh TLS handshake timed out"
+                );
+                return Err(TunnelError::Timeout(elapsed));
+            }
+        };
         tracing::info!(
             server_addr = %self.cfg.server_addr,
             server_name = %server_name_str,
@@ -661,12 +784,9 @@ impl TunnelConnector {
         {
             tracing::debug!("Sending handshake");
             let mut compat = control_stream.compat_write();
-            timeout(
-                self.cfg.connect_timeout,
-                send_handshake(&mut compat, &handshake),
-            )
-            .await
-            .map_err(TunnelError::Timeout)??;
+            timeout_at(connect_deadline, send_handshake(&mut compat, &handshake))
+                .await
+                .map_err(TunnelError::Timeout)??;
             control_stream = compat.into_inner();
             tracing::debug!("Handshake sent successfully");
         }
@@ -724,6 +844,15 @@ fn build_tls_config(cfg: &ConnectorConfig) -> Result<ClientConfig> {
                 cert_count += 1;
             }
         }
+        // An empty trust store would fail every handshake with a misleading
+        // "unknown issuer" and feed the retry loop forever; fail fast instead.
+        if cert_count == 0 {
+            return Err(TunnelError::Config(
+                "ca_certs contained PEM data but no certificates could be parsed; \
+                 refusing to build an empty trust store"
+                    .into(),
+            ));
+        }
         tracing::debug!(
             "Successfully loaded {} CA certificate(s) into trust store",
             cert_count
@@ -768,4 +897,93 @@ fn backoff_delay(attempt: u32, max_delay: Duration) -> Duration {
     let capped = attempt.min(6);
     let millis = 250u64.saturating_mul(1u64 << capped);
     min(Duration::from_millis(millis), max_delay)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::AsyncWrite;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A writer whose writes never complete — the on-wire equivalent of a
+    /// yamux stream whose send window is exhausted because the peer stopped
+    /// reading (the original permanent-freeze failure mode).
+    struct StuckWriter;
+
+    impl AsyncWrite for StuckWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_escapes_stuck_writer() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (dead_tx, mut dead_rx) = watch::channel(false);
+
+        // 10ms interval doubles as the per-write budget; the outer timeout is
+        // the assertion: without the write timeout the loop hangs forever.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            run_heartbeat(
+                StuckWriter,
+                "node-1".into(),
+                Duration::from_millis(10),
+                shutdown_rx,
+                dead_tx,
+            ),
+        )
+        .await
+        .expect("heartbeat loop must escape a stuck writer instead of freezing");
+
+        assert!(*dead_rx.borrow(), "tunnel_dead must be signalled");
+    }
+
+    #[test]
+    fn tls_error_classification() {
+        use tokio_rustls::rustls::CertificateError;
+
+        let expired = classify_tls_handshake_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            RustlsError::InvalidCertificate(CertificateError::Expired),
+        ));
+        assert!(
+            matches!(expired, TunnelError::Config(_)),
+            "certificate rejection must be terminal, got {expired:?}"
+        );
+        assert!(!expired.is_retryable());
+
+        let reset = classify_tls_handshake_error(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert!(reset.is_retryable(), "network failure must stay retryable");
+    }
+
+    #[test]
+    fn empty_ca_bundle_is_rejected() {
+        let cfg = ConnectorConfig {
+            ca_certs: vec![b"not a pem certificate".to_vec()],
+            ..Default::default()
+        };
+        let (_tx, rx) = watch::channel(false);
+        let err = match TunnelConnector::new(cfg, rx) {
+            Ok(_) => panic!("empty CA bundle must be rejected at construction"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, TunnelError::Config(_)), "got {err:?}");
+    }
 }
