@@ -334,6 +334,8 @@ impl GatewayConfig {
             connect_timeout: std::time::Duration::from_secs(10),
             max_backoff: std::time::Duration::from_secs(self.max_backoff_secs),
             heartbeat_interval: std::time::Duration::from_secs(15),
+            // The shipped binary never weakens verification; there is deliberately no CLI flag for this.
+            insecure_skip_verify: false,
         })
     }
 }
