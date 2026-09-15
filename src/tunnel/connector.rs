@@ -557,6 +557,14 @@ impl TunnelConnector {
                 Err(err) if err.is_retryable() => {
                     attempt = attempt.saturating_add(1);
                     let delay = backoff_delay(attempt, self.cfg.max_backoff);
+                    // Greppable prefix keeps node-side connect/handshake failures correlatable with server-side tunnel logs during cross-side diagnosis.
+                    tracing::warn!(
+                        attempt,
+                        server_addr = %self.cfg.server_addr,
+                        sni = ?self.cfg.sni,
+                        error = %err,
+                        "grpc-mesh retryable connect failure"
+                    );
                     tokio::select! {
                         _ = sleep(delay) => {}
                         _ = self.shutdown_rx.changed() => {
@@ -598,15 +606,30 @@ impl TunnelConnector {
 
         let server_name = ServerName::try_from(server_name_str.clone())
             .map_err(|_| TunnelError::Config(format!("invalid SNI hostname: {server_name_str}")))?;
+        tracing::info!(
+            server_addr = %self.cfg.server_addr,
+            server_name = %server_name_str,
+            "grpc-mesh TLS handshake start"
+        );
 
         tracing::debug!("Starting TLS handshake with SNI: {}", server_name_str);
         let tls_stream = TlsConnector::from(self.tls.clone())
             .connect(server_name, stream)
             .await
             .map_err(|e| {
-                tracing::error!("TLS handshake failed: {:?}", e);
+                tracing::error!(
+                    server_addr = %self.cfg.server_addr,
+                    server_name = %server_name_str,
+                    error = ?e,
+                    "grpc-mesh TLS handshake failed"
+                );
                 e
             })?;
+        tracing::info!(
+            server_addr = %self.cfg.server_addr,
+            server_name = %server_name_str,
+            "grpc-mesh TLS handshake success"
+        );
         tracing::debug!("TLS handshake successful");
 
         // Convert the Tokio IO into a futures-compatible IO for yamux.
