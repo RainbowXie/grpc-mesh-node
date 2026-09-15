@@ -1,55 +1,34 @@
 # grpc-mesh-node API 文档
 
+`grpc-mesh-node` 是 Rust 节点接入 gRPC-Mesh 的库。节点通过它主动外连控制平面（无需公网入站），在一条 TLS + yamux 隧道上对外提供 gRPC 服务。
+
 ## 概述
 
-`grpc-mesh-node` 是一个 Rust 实现的反向网关客户端框架，用于将内网服务通过 TLS + Yamux 隧道暴露给外部控制平面调用。
+库提供三件事：
 
-**核心特性：**
-- 🔐 TLS 1.3 加密通信
-- 🚀 Yamux 多路复用（单连接承载多个逻辑流）
-- 🔄 自动断线重连（指数退避）
-- 📡 gRPC 服务托管
-- 🔑 Token 认证
-- 📊 分布式追踪支持
+1. **隧道建立**（`tunnel::TunnelConnector`）：TLS 连接、yamux 多路复用、控制流握手与心跳。
+2. **服务承载**（`YamuxIncoming`）：把 yamux 连接适配成 tonic 可用的 incoming，节点的 gRPC 服务直接跑在隧道上。
+3. **通用方法分发**（`MethodRegistry` + `rpc::InvokeService`）：以"方法名字符串 + 不透明字节"的通用形式暴露函数，供控制平面经 `InvokePlaneService.Invoke` 调用。
 
----
+节点可以同时挂载**类型化服务**（按 proto 定义、由 tonic 生成代码实现，如 `calculator.v1.Calculator`）与通用分发服务，两者在同一 tonic 服务器上按 gRPC 路径共存。控制平面侧对类型化服务用生成的客户端代码直调（`Gateway.Dial`），对通用分发走 `Invoke`。
 
 ## 架构概览
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  grpc-mesh-node (内网节点)                                    │
-│                                                         │
-│  ┌──────────────┐    ┌──────────────┐                 │
-│  │  Your gRPC   │───▶│  Transport   │                 │
-│  │  Service     │    │  Connector   │                 │
-│  └──────────────┘    └──────┬───────┘                 │
-│                              │                          │
-│                              ▼                          │
-│                       ┌─────────────┐                  │
-│                       │   Yamux     │                  │
-│                       │  Connection │                  │
-│                       └──────┬──────┘                  │
-│                              │                          │
-│                              ▼                          │
-│                       ┌─────────────┐                  │
-│                       │ TLS 1.3     │                  │
-│                       │ (rustls)    │                  │
-│                       └──────┬──────┘                  │
-└──────────────────────────────┼──────────────────────────┘
-                               │ TCP (主动出网)
-                               ▼
-┌─────────────────────────────────────────────────────────┐
-│  grpc-mesh-server (公网控制平面 - Go)                       │
-│                                                         │
-│  ┌──────────────┐    ┌──────────────┐                 │
-│  │  gRPC Client │◀───│  Reverse     │                 │
-│  │  (业务调用)   │    │  Gateway     │                 │
-│  └──────────────┘    └──────────────┘                 │
-└─────────────────────────────────────────────────────────┘
+节点（本库）                                控制平面（grpc-mesh-server）
+┌─────────────────────────┐
+│ tonic Server            │
+│  ├─ GreeterServer       │   类型化服务：标准 gRPC（HTTP/2 + protobuf）
+│  └─ InvokeService       │   通用分发：Invoke(method: string, payload: bytes)
+│ YamuxIncoming           │
+│ yamux Connection        │   多条流复用一条 TLS 连接
+│ TLS (rustls)            │
+└───────────┬─────────────┘
+            │ 控制流（第一条流）：握手 JSON + 心跳 JSON（长度前缀帧）
+            ▼
 ```
 
----
+控制流协议：4 字节大端长度前缀 + JSON。握手为裸 `Handshake` JSON；心跳为 `{"type":"heartbeat","heartbeat":{...}}` 包装。心跳由库内任务自动发送，间隔取 `ConnectorConfig::heartbeat_interval`；写失败或超过一个间隔未完成会标记隧道死亡（见 `connect_with_backoff_watched`）。
 
 ## 快速开始
 
@@ -57,21 +36,19 @@
 
 ```toml
 [dependencies]
-grpc-mesh-node = { path = "../grpc-mesh-node" }
-tokio = { version = "1.38", features = ["full"] }
-tonic = "0.11"
+grpc-mesh = { path = "../grpc-mesh-node" }
+tokio = { version = "1", features = ["full"] }
+tonic = "0.14"
+prost = "0.14"
 ```
 
-### 2. 实现你的 gRPC 服务
+### 2. 实现类型化 gRPC 服务（可选）与通用方法
 
 ```rust
-use tonic::{Request, Response, Status};
-
 pub mod hello {
     tonic::include_proto!("hello");
 }
 
-use hello::{HelloRequest, HelloResponse};
 use hello::greeter_server::{Greeter, GreeterServer};
 
 pub struct MyGreeter;
@@ -80,968 +57,158 @@ pub struct MyGreeter;
 impl Greeter for MyGreeter {
     async fn say_hello(
         &self,
-        request: Request<HelloRequest>,
-    ) -> Result<Response<HelloResponse>, Status> {
+        request: tonic::Request<hello::HelloRequest>,
+    ) -> Result<tonic::Response<hello::HelloResponse>, tonic::Status> {
         let name = request.into_inner().name;
-        let reply = HelloResponse {
-            message: format!("Hello, {}!", name),
-        };
-        Ok(Response::new(reply))
-    }
-}
-```
-
-### 3. 启动反向网关
-
-```rust
-use wa_emu_rs::gateway::ReverseGateway;
-use wa_emu_rs::config::GatewayConfig;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 加载配置
-    let config = GatewayConfig::load("config.json")?;
-    
-    // 2. 创建网关
-    let gateway = ReverseGateway::new(config).await?;
-    
-    // 3. 注册 gRPC 服务
-    let greeter = MyGreeter;
-    gateway.add_service(GreeterServer::new(greeter));
-    
-    // 4. 启动（阻塞直到收到 SIGINT/SIGTERM）
-    gateway.serve().await?;
-    
-    Ok(())
-}
-```
-
----
-
-## 核心 API
-
-### 1. `GatewayConfig`
-
-配置结构体，定义连接参数、认证信息和重连策略。
-
-#### 字段说明
-
-```rust
-pub struct GatewayConfig {
-    /// 服务端地址（格式: "host:port"）
-    pub server_address: String,
-    
-    /// TLS 配置
-    pub tls: TlsConfig,
-    
-    /// 节点配置
-    pub node: NodeConfig,
-    
-    /// 重连策略
-    pub reconnect: ReconnectConfig,
-}
-
-pub struct TlsConfig {
-    /// 服务端域名（用于证书验证）
-    pub server_name: String,
-    
-    /// CA 证书路径（可选，默认使用系统根证书）
-    pub ca_cert_path: Option<String>,
-}
-
-pub struct NodeConfig {
-    /// 节点 ID（"auto" 表示自动生成）
-    pub id: String,
-    
-    /// 认证 Token
-    pub token: String,
-    
-    /// 节点版本
-    pub version: String,
-    
-    /// 支持的功能特性列表
-    pub supported_features: Vec<String>,
-    
-    /// 附加元数据
-    pub metadata: HashMap<String, String>,
-}
-
-pub struct ReconnectConfig {
-    /// 初始重连延迟（秒）
-    pub base_delay_secs: u64,
-    
-    /// 最大重连延迟（秒）
-    pub max_delay_secs: u64,
-    
-    /// 最大重试次数（0 表示无限重试）
-    pub max_retries: u32,
-    
-    /// 退避倍数
-    pub backoff_multiplier: f64,
-}
-```
-
-#### 从文件加载
-
-```rust
-// 从 JSON 文件加载
-let config = GatewayConfig::load("config.json")?;
-
-// 从 TOML 文件加载
-let config = GatewayConfig::load_toml("config.toml")?;
-
-// 从环境变量覆盖
-let mut config = GatewayConfig::load("config.json")?;
-config.apply_env_overrides();
-```
-
-#### 环境变量覆盖
-
-| 环境变量 | 配置字段 | 说明 |
-|---------|---------|------|
-| `WA_SERVER_ADDRESS` | `server_address` | 服务端地址 |
-| `WA_NODE_ID` | `node.id` | 节点 ID |
-| `WA_NODE_TOKEN` | `node.token` | 认证 Token |
-| `WA_NODE_VERSION` | `node.version` | 节点版本 |
-| `WA_TLS_SERVER_NAME` | `tls.server_name` | TLS 服务端域名 |
-| `WA_TLS_CA_CERT` | `tls.ca_cert_path` | CA 证书路径 |
-
-#### 配置文件示例
-
-**JSON 格式：**
-
-```json
-{
-  "server": {
-    "address": "gateway.example.com:8443",
-    "tls": {
-      "server_name": "gateway.example.com",
-      "ca_cert_path": "/etc/wa-emu/ca.crt"
-    }
-  },
-  "node": {
-    "id": "auto",
-    "token": "waemu_your_token_here",
-    "version": "1.0.0",
-    "supported_features": ["invoke", "health", "echo"],
-    "metadata": {
-      "region": "us-west-2",
-      "env": "production"
-    }
-  },
-  "reconnect": {
-    "base_delay_secs": 1,
-    "max_delay_secs": 60,
-    "max_retries": 0,
-    "backoff_multiplier": 2.0
-  }
-}
-```
-
-**TOML 格式：**
-
-```toml
-[server]
-address = "gateway.example.com:8443"
-
-[server.tls]
-server_name = "gateway.example.com"
-ca_cert_path = "/etc/wa-emu/ca.crt"
-
-[node]
-id = "auto"
-token = "waemu_your_token_here"
-version = "1.0.0"
-supported_features = ["invoke", "health", "echo"]
-
-[node.metadata]
-region = "us-west-2"
-env = "production"
-
-[reconnect]
-base_delay_secs = 1
-max_delay_secs = 60
-max_retries = 0
-backoff_multiplier = 2.0
-```
-
----
-
-### 2. `ReverseGateway`
-
-反向网关核心类，负责连接管理、服务托管和生命周期控制。
-
-#### 创建网关
-
-```rust
-use wa_emu_rs::gateway::ReverseGateway;
-
-// 从配置创建
-let gateway = ReverseGateway::new(config).await?;
-
-// 带自定义 tracing 层
-let gateway = ReverseGateway::builder()
-    .config(config)
-    .with_tracing_layer(tracing_layer)
-    .build()
-    .await?;
-```
-
-#### 注册 gRPC 服务
-
-```rust
-use tonic::transport::server::Router;
-
-// 方式 1：直接添加服务
-gateway.add_service(GreeterServer::new(greeter));
-
-// 方式 2：使用 Router
-let router = Router::new()
-    .add_service(GreeterServer::new(greeter))
-    .add_service(HealthServer::new(health));
-gateway.set_router(router);
-
-// 方式 3：链式调用
-gateway
-    .add_service(GreeterServer::new(greeter))
-    .add_service(HealthServer::new(health))
-    .add_service(MetricsServer::new(metrics));
-```
-
-#### 启动网关
-
-```rust
-// 阻塞直到收到停止信号
-gateway.serve().await?;
-
-// 带超时启动
-use tokio::time::{timeout, Duration};
-timeout(Duration::from_secs(30), gateway.serve()).await??;
-
-// 手动控制生命周期
-let handle = gateway.spawn();
-// ... 做其他事情 ...
-gateway.shutdown().await?;
-```
-
-#### 健康检查
-
-```rust
-// 检查连接状态
-if gateway.is_connected() {
-    println!("Gateway is connected");
-}
-
-// 获取连接统计
-let stats = gateway.connection_stats();
-println!("Reconnect count: {}", stats.reconnect_count);
-println!("Uptime: {:?}", stats.uptime);
-```
-
-#### 动态更新方法列表
-
-```rust
-use wa_emu_rs::method::{MethodDescriptor, MethodMetadata};
-
-let methods = vec![
-    MethodDescriptor {
-        name: "greeter.SayHello".to_string(),
-        description: Some("Greet a user".to_string()),
-        tags: vec!["hello".to_string()],
-        metadata: MethodMetadata::default(),
-    },
-];
-
-gateway.update_methods(methods).await?;
-```
-
----
-
-### 3. `TransportConnector`
-
-底层传输层连接器，处理 TCP → TLS → Yamux 连接建立和重连。
-
-#### 创建连接器
-
-```rust
-use wa_emu_rs::transport::TransportConnector;
-
-let connector = TransportConnector::new(
-    "gateway.example.com:8443",
-    tls_config,
-    reconnect_config,
-).await?;
-```
-
-#### 获取 Yamux 连接
-
-```rust
-// 获取当前连接（如果已连接）
-let connection = connector.connection().await?;
-
-// 打开新流
-let stream = connector.open_stream().await?;
-```
-
-#### 监听连接事件
-
-```rust
-let mut event_rx = connector.subscribe_events();
-
-tokio::spawn(async move {
-    while let Some(event) = event_rx.recv().await {
-        match event {
-            TransportEvent::Connected => {
-                println!("Connected to server");
-            }
-            TransportEvent::Disconnected(reason) => {
-                println!("Disconnected: {}", reason);
-            }
-            TransportEvent::Reconnecting(attempt) => {
-                println!("Reconnecting (attempt {})", attempt);
-            }
-            TransportEvent::Error(err) => {
-                eprintln!("Transport error: {}", err);
-            }
-        }
-    }
-});
-```
-
----
-
-### 4. 控制流 API
-
-控制流用于握手、心跳和方法注册。
-
-#### 握手
-
-握手在连接建立后自动执行，包含节点认证和元数据交换。
-
-**握手消息格式：**
-
-```json
-{
-  "type": "handshake",
-  "payload": {
-    "node_id": "myhost-a1b2c3d4",
-    "token": "waemu_your_token_here",
-    "version": "1.0.0",
-    "features": ["invoke", "health"],
-    "metadata": {
-      "hostname": "myhost",
-      "os": "linux",
-      "arch": "x86_64"
-    }
-  }
-}
-```
-
-**响应：**
-
-```json
-{
-  "accepted": true,
-  "session_id": "sess_abc123",
-  "server_version": "1.0.0"
-}
-```
-
-#### 心跳
-
-心跳自动发送，默认间隔 30 秒。
-
-```rust
-// 自定义心跳间隔
-let config = GatewayConfig {
-    heartbeat_interval_secs: 15,
-    ..Default::default()
-};
-
-// 禁用心跳（不推荐）
-let config = GatewayConfig {
-    heartbeat_enabled: false,
-    ..Default::default()
-};
-```
-
-**心跳消息格式：**
-
-```json
-{
-  "type": "heartbeat",
-  "payload": {
-    "node_id": "myhost-a1b2c3d4",
-    "timestamp": 1704067200000,
-    "metrics": {
-      "cpu_usage": 45.2,
-      "memory_usage": 1024000000,
-      "active_streams": 3
-    }
-  }
-}
-```
-
-#### 方法注册
-
-```rust
-// 手动触发方法注册
-gateway.register_methods().await?;
-
-// 自动注册（启动时）
-let gateway = ReverseGateway::builder()
-    .config(config)
-    .auto_register_methods(true)
-    .build()
-    .await?;
-```
-
----
-
-## 高级用法
-
-### 1. 自定义中间件
-
-```rust
-use tonic::body::BoxBody;
-use tower::{Layer, Service};
-use std::task::{Context, Poll};
-
-// 定义中间件
-#[derive(Clone)]
-struct LoggingMiddleware<S> {
-    inner: S,
-}
-
-impl<S> Service<hyper::Request<BoxBody>> for LoggingMiddleware<S>
-where
-    S: Service<hyper::Request<BoxBody>>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: hyper::Request<BoxBody>) -> Self::Future {
-        println!("Request: {:?}", req);
-        self.inner.call(req)
-    }
-}
-
-// 应用中间件
-let gateway = ReverseGateway::builder()
-    .config(config)
-    .layer(LoggingMiddleware)
-    .build()
-    .await?;
-```
-
-### 2. 自定义错误处理
-
-```rust
-use wa_emu_rs::error::{GatewayError, ErrorHandler};
-
-struct MyErrorHandler;
-
-impl ErrorHandler for MyErrorHandler {
-    fn handle_connection_error(&self, err: &GatewayError) {
-        // 发送告警、记录日志等
-        eprintln!("Connection error: {}", err);
-    }
-
-    fn handle_service_error(&self, method: &str, err: &tonic::Status) {
-        eprintln!("Service error in {}: {}", method, err);
-    }
-}
-
-let gateway = ReverseGateway::builder()
-    .config(config)
-    .error_handler(MyErrorHandler)
-    .build()
-    .await?;
-```
-
-### 3. 动态证书更新
-
-```rust
-// 监听证书文件变化
-use notify::{Watcher, RecursiveMode};
-
-let (tx, rx) = tokio::sync::mpsc::channel(1);
-let mut watcher = notify::recommended_watcher(move |res| {
-    tx.blocking_send(res).ok();
-})?;
-
-watcher.watch(Path::new("/etc/wa-emu/ca.crt"), RecursiveMode::NonRecursive)?;
-
-tokio::spawn(async move {
-    while let Some(Ok(event)) = rx.recv().await {
-        println!("Certificate changed: {:?}", event);
-        gateway.reload_tls_config().await?;
-    }
-});
-```
-
-### 4. 指标收集
-
-```rust
-use wa_emu_rs::metrics::{MetricsCollector, MetricsSnapshot};
-
-// 获取指标快照
-let metrics = gateway.metrics_snapshot();
-println!("Total requests: {}", metrics.total_requests);
-println!("Error rate: {:.2}%", metrics.error_rate * 100.0);
-
-// 导出 Prometheus 格式
-let prometheus_text = gateway.metrics_prometheus();
-println!("{}", prometheus_text);
-
-// 注册自定义指标
-gateway.register_metric("my_custom_counter", MetricType::Counter);
-gateway.increment_metric("my_custom_counter", 1);
-```
-
----
-
-## 错误处理
-
-### 错误类型
-
-```rust
-pub enum GatewayError {
-    /// 配置错误
-    ConfigError(String),
-    
-    /// 连接错误
-    ConnectionError(std::io::Error),
-    
-    /// TLS 错误
-    TlsError(rustls::Error),
-    
-    /// 认证失败
-    AuthenticationFailed(String),
-    
-    /// 握手失败
-    HandshakeError(String),
-    
-    /// 服务调用错误
-    ServiceError(tonic::Status),
-    
-    /// 超时
-    Timeout,
-    
-    /// 其他错误
-    Other(String),
-}
-```
-
-### 错误处理示例
-
-```rust
-use wa_emu_rs::error::GatewayError;
-
-match gateway.serve().await {
-    Ok(_) => println!("Gateway stopped gracefully"),
-    Err(GatewayError::AuthenticationFailed(msg)) => {
-        eprintln!("Authentication failed: {}", msg);
-        std::process::exit(1);
-    }
-    Err(GatewayError::ConnectionError(e)) => {
-        eprintln!("Connection error: {}", e);
-        // 可能需要重试或告警
-    }
-    Err(e) => {
-        eprintln!("Unexpected error: {}", e);
-        std::process::exit(2);
-    }
-}
-```
-
----
-
-## 最佳实践
-
-### 1. 生产环境配置
-
-```rust
-let config = GatewayConfig {
-    server_address: "gateway.example.com:8443".to_string(),
-    
-    tls: TlsConfig {
-        server_name: "gateway.example.com".to_string(),
-        ca_cert_path: Some("/etc/wa-emu/ca.crt".to_string()),
-    },
-    
-    node: NodeConfig {
-        id: std::env::var("WA_NODE_ID")
-            .unwrap_or_else(|_| "auto".to_string()),
-        token: std::env::var("WA_NODE_TOKEN")
-            .expect("WA_NODE_TOKEN must be set"),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        supported_features: vec![
-            "invoke".to_string(),
-            "health".to_string(),
-        ],
-        metadata: Default::default(),
-    },
-    
-    reconnect: ReconnectConfig {
-        base_delay_secs: 1,
-        max_delay_secs: 60,
-        max_retries: 0, // 无限重试
-        backoff_multiplier: 2.0,
-    },
-    
-    heartbeat_interval_secs: 30,
-    heartbeat_timeout_secs: 90,
-};
-```
-
-### 2. 优雅关闭
-
-```rust
-use tokio::signal;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let gateway = ReverseGateway::new(config).await?;
-    gateway.add_service(MyService::new());
-    
-    // 启动网关
-    let gateway_handle = tokio::spawn(async move {
-        gateway.serve().await
-    });
-    
-    // 等待停止信号
-    signal::ctrl_c().await?;
-    println!("Shutting down...");
-    
-    // 优雅关闭（等待现有请求完成）
-    gateway.shutdown_with_timeout(Duration::from_secs(30)).await?;
-    
-    gateway_handle.await??;
-    println!("Shutdown complete");
-    
-    Ok(())
-}
-```
-
-### 3. 日志和追踪
-
-```rust
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-fn init_tracing() {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
-    
-    // Gateway 会自动记录结构化日志
-    let gateway = ReverseGateway::new(config).await?;
-    gateway.serve().await?;
-    
-    Ok(())
-}
-```
-
-**日志级别设置：**
-
-```bash
-# 设置全局日志级别
-RUST_LOG=info ./my_gateway
-
-# 细粒度控制
-RUST_LOG=wa_emu_rs=debug,my_service=info ./my_gateway
-
-# 只显示错误
-RUST_LOG=error ./my_gateway
-```
-
-### 4. 健康检查端点
-
-```rust
-use tonic::{Request, Response, Status};
-
-pub mod health {
-    tonic::include_proto!("grpc.health.v1");
-}
-
-use health::{HealthCheckRequest, HealthCheckResponse, ServingStatus};
-use health::health_server::{Health, HealthServer};
-
-pub struct HealthService {
-    gateway: Arc<ReverseGateway>,
-}
-
-#[tonic::async_trait]
-impl Health for HealthService {
-    async fn check(
-        &self,
-        _request: Request<HealthCheckRequest>,
-    ) -> Result<Response<HealthCheckResponse>, Status> {
-        let status = if self.gateway.is_connected() {
-            ServingStatus::Serving
-        } else {
-            ServingStatus::NotServing
-        };
-        
-        Ok(Response::new(HealthCheckResponse {
-            status: status as i32,
+        Ok(tonic::Response::new(hello::HelloResponse {
+            message: format!("Hello, {name}!"),
         }))
     }
 }
-
-// 注册健康检查服务
-gateway.add_service(HealthServer::new(HealthService {
-    gateway: Arc::clone(&gateway),
-}));
 ```
 
----
-
-## 故障排查
-
-### 问题 1：连接超时
-
-**症状：**
-```
-ERROR Connection timeout: failed to connect to gateway.example.com:8443
-```
-
-**可能原因：**
-1. 网络不可达
-2. 防火墙阻止
-3. 服务端未启动
-
-**解决方案：**
-```bash
-# 测试网络连通性
-ping gateway.example.com
-
-# 测试端口
-telnet gateway.example.com 8443
-
-# 检查防火墙
-sudo iptables -L -n | grep 8443
-```
-
-### 问题 2：TLS 握手失败
-
-**症状：**
-```
-ERROR TLS handshake error: invalid certificate
-```
-
-**可能原因：**
-1. CA 证书不匹配
-2. 证书过期
-3. 服务端域名不匹配
-
-**解决方案：**
-```bash
-# 检查证书有效期
-openssl x509 -in /etc/wa-emu/ca.crt -noout -dates
-
-# 验证证书链
-openssl s_client -connect gateway.example.com:8443 -CAfile /etc/wa-emu/ca.crt
-
-# 检查服务端域名
-openssl s_client -connect gateway.example.com:8443 | openssl x509 -noout -text | grep DNS
-```
-
-### 问题 3：认证失败
-
-**症状：**
-```
-ERROR Handshake rejected: invalid token
-```
-
-**解决方案：**
-1. 确认 Token 正确配置
-2. 检查 Token 是否在服务端允许列表中
-3. 确认 Token 未过期
-
-```bash
-# 验证环境变量
-echo $WA_NODE_TOKEN
-
-# 重新生成 Token
-cd grpc-mesh-server
-bash scripts/gen-token.sh
-```
-
-### 问题 4：频繁重连
-
-**症状：**
-```
-WARN Reconnecting (attempt 10)
-WARN Reconnecting (attempt 11)
-```
-
-**可能原因：**
-1. 网络不稳定
-2. 服务端过载
-3. 心跳超时设置过短
-
-**解决方案：**
-```rust
-// 调整重连参数
-let config = GatewayConfig {
-    reconnect: ReconnectConfig {
-        base_delay_secs: 2,      // 增加初始延迟
-        max_delay_secs: 120,     // 增加最大延迟
-        backoff_multiplier: 2.5, // 增加退避倍数
-        ..Default::default()
-    },
-    heartbeat_interval_secs: 60, // 增加心跳间隔
-    ..Default::default()
-};
-```
-
----
-
-## 性能优化
-
-### 1. 并发流控制
+不需要类型化服务时，只注册通用方法即可：
 
 ```rust
-// 限制最大并发流数量
-let config = GatewayConfig {
-    max_concurrent_streams: 64,
-    ..Default::default()
-};
+use grpc_mesh::{MethodRegistry, RpcResult};
+use std::sync::Arc;
+
+let registry = MethodRegistry::default();
+registry.register(
+    "echo",
+    Arc::new(|payload: Vec<u8>| -> RpcResult<Vec<u8>> { Ok(payload) }),
+);
 ```
 
-### 2. 缓冲区大小
+### 3. 建立隧道并服务
 
 ```rust
-// 调整 Yamux 窗口大小
-let config = GatewayConfig {
-    yamux_window_size: 256 * 1024, // 256KB
-    ..Default::default()
-};
-```
+use grpc_mesh::rpc::InvokeService;
+use grpc_mesh::tunnel::{ConnectorConfig, Handshake, TunnelConnector};
+use tokio::sync::watch;
 
-### 3. Keep-Alive 设置
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-```rust
-// 启用 TCP Keep-Alive
-let config = GatewayConfig {
-    tcp_keepalive_secs: Some(60),
-    tcp_nodelay: true,
-    ..Default::default()
-};
-```
+    let connector = TunnelConnector::new(
+        ConnectorConfig {
+            server_addr: "mesh.example.com:8443".into(),
+            // PEM 原始字节；留空使用系统根证书
+            ca_certs: vec![std::fs::read("ca.crt")?],
+            sni: None,
+            connect_timeout: std::time::Duration::from_secs(10),
+            max_backoff: std::time::Duration::from_secs(30),
+            heartbeat_interval: std::time::Duration::from_secs(15),
+            insecure_skip_verify: false,
+        },
+        shutdown_rx,
+    )?;
 
----
+    let registry = MethodRegistry::default();
+    // ... register(...) 方法 ...
 
-## 示例代码
+    // 方法清单随握手上报，控制平面经 SessionState::Methods() 可查
+    let mut methods = registry.methods();
+    methods.sort();
 
-完整示例请参考：
-- `examples/basic_gateway.rs` - 基础用法
-- `examples/multi_service.rs` - 多服务注册
-- `examples/custom_middleware.rs` - 自定义中间件
-- `examples/metrics_export.rs` - 指标导出
+    let handshake = Handshake::builder("my-node", env!("CARGO_PKG_VERSION"))
+        .token(std::env::var("TUNNEL_TOKEN")?)
+        .add_feature("grpc")
+        .metadata_entry("mesh.methods", methods.join(","))
+        .build()?;
 
----
+    let incoming = connector.connect_with_backoff(handshake).await?;
 
-## API 参考
+    tonic::transport::Server::builder()
+        .add_service(GreeterServer::new(MyGreeter))          // 类型化路径
+        .add_service(InvokeService::new(registry).into_server()) // 通用分发路径
+        .serve_with_incoming(incoming)
+        .await?;
 
-完整 API 文档请运行：
-
-```bash
-cargo doc --open
-```
-
----
-
-## 常见问题（FAQ）
-
-**Q: 可以在一个进程中运行多个 Gateway 实例吗？**
-
-A: 可以，只要它们使用不同的 Node ID：
-
-```rust
-let gateway1 = ReverseGateway::builder()
-    .node_id("node-1")
-    .config(config1)
-    .build().await?;
-
-let gateway2 = ReverseGateway::builder()
-    .node_id("node-2")
-    .config(config2)
-    .build().await?;
-
-tokio::try_join!(gateway1.serve(), gateway2.serve())?;
-```
-
-**Q: 如何限制 gRPC 消息大小？**
-
-A: 在注册服务时设置：
-
-```rust
-let service = GreeterServer::new(greeter)
-    .max_decoding_message_size(4 * 1024 * 1024)  // 4MB
-    .max_encoding_message_size(4 * 1024 * 1024);
-
-gateway.add_service(service);
-```
-
-**Q: 支持 WebSocket 吗？**
-
-A: 当前版本不支持，但可以通过 gRPC 流实现类似功能：
-
-```rust
-#[tonic::async_trait]
-impl MyService for MyServiceImpl {
-    type StreamMethod = ReceiverStream<Result<Response, Status>>;
-    
-    async fn stream_method(
-        &self,
-        request: Request<StreamRequest>,
-    ) -> Result<Response<Self::StreamMethod>, Status> {
-        let (tx, rx) = mpsc::channel(128);
-        // 实现双向流
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
+    Ok(())
 }
 ```
 
-**Q: 如何实现负载均衡？**
+需要"隧道断开后自动重连"的长驻进程，参考 `src/bin/reverse_gateway.rs`：用 `connect_with_backoff_watched` 取得死亡信号，在 select 中监视，隧道结束时丢弃 serve future 并带退避重连。
 
-A: 负载均衡由服务端（grpc-mesh-server）实现，客户端只需注册多个相同方法即可。
+## 核心 API
 
----
+### `ConnectorConfig`
 
-## 更新日志
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `server_addr` | `String` | 控制平面地址 `host:port` |
+| `ca_certs` | `Vec<Vec<u8>>` | **PEM 原始字节**。非空时仅用这些 CA 验证服务端证书；空则用系统根。注意传入 DER 或无法解析出证书会在构造时报 `Config` 错误 |
+| `sni` | `Option<String>` | SNI 覆盖；缺省取 `server_addr` 的 host 部分 |
+| `connect_timeout` | `Duration` | TCP + TLS + yamux + 握手帧的总预算 |
+| `max_backoff` | `Duration` | 连接重试退避上限（250ms 起步倍增） |
+| `heartbeat_interval` | `Duration` | 心跳间隔；同时是单次心跳写完成的超时 |
+| `insecure_skip_verify` | `bool` | 跳过证书验证，仅限受控开发场景 |
 
-### v0.1.0 (2024-01-15)
-- ✅ 初始版本发布
-- ✅ TLS + Yamux 传输层
-- ✅ 控制流（握手、心跳）
-- ✅ gRPC 服务托管
-- ✅ 自动重连机制
-- ✅ Token 认证
+### `TunnelConnector`
 
----
+```rust
+pub fn new(cfg: ConnectorConfig, shutdown_rx: watch::Receiver<bool>) -> Result<Self>
+pub async fn connect_with_backoff(&mut self, handshake: Handshake) -> Result<YamuxIncoming>
+pub async fn connect_with_backoff_watched(
+    &mut self,
+    handshake: Handshake,
+    tunnel_dead: watch::Sender<bool>,
+) -> Result<YamuxIncoming>
+```
 
-## 许可证
+- 连接失败按 `is_retryable()` 分类：瞬时错误指数退避重试；`Config`/`Shutdown` 终止。
+- TLS 握手被对端拒绝（证书过期、CA 不对、SNI 不匹配等）归类为**永久 `Config` 错误**，直接失败不重试。
+- `connect_with_backoff_watched` 额外在心跳写停滞/失败时把 `tunnel_dead` 置位，供监督循环感知半死连接。
 
-[待定]
+### `Handshake` / `HandshakeBuilder`
 
----
+```rust
+Handshake::builder(node_id, version)
+    .token(token)                       // 必填
+    .add_feature("grpc")                // 可重复
+    .metadata_entry("mesh.methods", "a.B/C,a.B/D")  // 任意键值
+    .build()?
+```
 
-## 技术支持
+`node_id`、`version`、`token` 非空才会通过校验。控制平面配置 `auth.node_tokens` 时，token 与 node_id 绑定校验。
 
-- 📧 Email: support@example.com
-- 💬 Issues: https://github.com/wa-emu/grpc-mesh-node/issues
-- 📖 文档: https://wa-emu.example.com/docs
+### `MethodRegistry`
+
+```rust
+pub fn register<S: Into<String>>(&self, method: S, handler: MethodHandler)
+pub fn register_with_request<S: Into<String>>(&self, method: S, handler: MethodHandlerWithRequest)
+pub fn methods(&self) -> Vec<String>   // 已注册方法名（顺序不定）
+```
+
+`MethodHandler = Arc<dyn Fn(Vec<u8>) -> RpcResult<Vec<u8>> + Send + Sync>`。方法名建议用 gRPC 全名（如 `calculator.v1.Calculator/Add`），与类型化路径的 gRPC 路径一致，便于控制平面统一展示。
+
+### `InvokeService`
+
+实现 `InvokePlaneService`（`Invoke` 一元 + `InvokeStream` 双向流），把请求按方法名分发给 `MethodRegistry`。`.into_server()` 得到 tonic 可挂载的服务。
+
+### `YamuxIncoming` / `Tunnel`
+
+`connect_with_backoff*` 返回 `YamuxIncoming`，直接传给 `serve_with_incoming`。`YamuxIncoming::handshake()` 可取回握手元数据。不需要心跳托管时可用 `Tunnel::into_parts()` 自管控制流。
+
+## 方法上报约定
+
+握手 metadata 的 `mesh.methods` 键 = 逗号分隔的方法名清单。控制平面在会话上以 `SessionState.Methods()` 暴露（去空白、忽略空段；未上报为空）。当前为连接时一次性快照，方法动态增删不会更新。
+
+## 错误处理
+
+`tunnel::TunnelError` 主要变体：`Config`（配置/永久性拒绝，**不重试**）、`Network`、`Tls`、`Yamux`、`Handshake`、`Timeout`（以上重试）、`Shutdown`。用 `is_retryable()` / `is_terminal()` 判定。
+
+## 故障排查
+
+- **`Config("TLS handshake rejected: invalid peer certificate: UnknownIssuer ...")` 且进程退出**：这是预期行为——CA 与服务端证书不匹配属永久错误，不会重试。检查 `ca_certs` 是否为正确的 PEM 字节。
+- **`Config("ca_certs contained PEM data but no certificates could be parsed")`**：传入了 DER 或损坏的 PEM。`ca_certs` 必须是 PEM 原始字节，不要预解析。
+- **连接后静默无心跳**：确认控制平面可达且证书匹配；心跳写超时后监督方会收到 `tunnel_dead` 信号。
+- **升级后编译报 E0063（missing field）**：`ConnectorConfig` 新增字段时需在初始化处补齐（`..Default::default()` 可避免）。
+
+## 参考
+
+- 完整监督循环示例：`src/bin/reverse_gateway.rs`
+- 通用 + 类型化双路径示例：`demos/calculator-service/src/main.rs`
+- 控制平面侧调用：grpc-mesh-server `pkg/reverse/gateway.go`（`Invoke` 通用分发 / `Dial` 类型化拨号）
