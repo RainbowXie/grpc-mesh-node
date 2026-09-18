@@ -430,15 +430,18 @@ fn dispatch(
 
         // Java exceptions are extracted, cleared and converted to a
         // structured error; the JVM and the Rust runtime keep working.
+        // Grab the throwable local reference BEFORE clearing: calling
+        // methods with a pending exception is not allowed on ART, so the
+        // description is built only after the exception is cleared.
         if env.exception_check().unwrap_or(false) {
-            let description = env
-                .exception_occurred()
-                .ok()
-                .and_then(|throwable| describe_throwable(env, &throwable))
-                .unwrap_or_else(|| "java exception".to_string());
+            let throwable = env.exception_occurred().ok();
             if env.exception_clear().is_err() {
                 return Err(DispatchError::Msg("clearing java exception failed".into()));
             }
+            let description = throwable
+                .as_ref()
+                .and_then(|throwable| describe_throwable(env, throwable))
+                .unwrap_or_else(|| "java exception".to_string());
             return Err(DispatchError::Msg(format!("java handler threw: {description}")));
         }
 
