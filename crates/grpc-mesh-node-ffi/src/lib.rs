@@ -39,6 +39,7 @@
 //!   `MESH_NODE_ERR_INTERNAL` plus a thread-local message.
 
 mod cerror;
+mod jni_shim;
 mod response;
 
 use std::collections::BTreeMap;
@@ -211,7 +212,6 @@ unsafe impl Send for MethodRegistration {}
 unsafe impl Sync for MethodRegistration {}
 
 struct NodeEntry {
-    id: u64,
     state: Mutex<AbiState>,
     node: EmbeddedNode,
     methods: Mutex<BTreeMap<String, MethodRegistration>>,
@@ -330,7 +330,6 @@ pub unsafe extern "C" fn mesh_node_new(config_json: *const c_char) -> MeshNodeHa
 
         let id = NODES.next.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(NodeEntry {
-            id,
             state: Mutex::new(AbiState::Created),
             node: EmbeddedNode::new(config),
             methods: Mutex::new(BTreeMap::new()),
