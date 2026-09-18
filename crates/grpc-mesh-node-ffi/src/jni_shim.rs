@@ -391,14 +391,27 @@ impl DispatchError {
     }
 }
 
+unsafe fn request_payload(request: &MeshNodeRequest) -> Result<&[u8], &'static str> {
+    // The C ABI deliberately represents an empty payload as NULL + 0.
+    // Rust slices require a non-null aligned pointer even at length zero,
+    // so only construct a borrowed slice when bytes are actually present.
+    if request.payload_len == 0 {
+        Ok(&[])
+    } else if request.payload.is_null() {
+        Err("request payload is null with non-zero length")
+    } else {
+        Ok(unsafe { std::slice::from_raw_parts(request.payload, request.payload_len) })
+    }
+}
+
 fn dispatch(
     env: &mut JNIEnv,
     handler: &JniHandler,
     request: &MeshNodeRequest,
 ) -> Result<Vec<u8>, String> {
     env.with_local_frame(32, |env| {
-        let payload: &[u8] =
-            unsafe { std::slice::from_raw_parts(request.payload, request.payload_len) };
+        let payload = unsafe { request_payload(request) }
+            .map_err(|message| DispatchError::Msg(message.to_owned()))?;
         let j_payload = env
             .byte_array_from_slice(payload)
             .map_err(|e| DispatchError::Msg(format!("payload array: {e}")))?;
@@ -468,6 +481,49 @@ fn dispatch(
         Ok(buffer)
     })
     .map_err(|err: DispatchError| err.message())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_payload;
+    use crate::MeshNodeRequest;
+    use std::ptr;
+
+    fn request(payload: *const u8, payload_len: usize) -> MeshNodeRequest {
+        MeshNodeRequest {
+            payload,
+            payload_len,
+            method: ptr::null(),
+            correlation_id: ptr::null(),
+            timeout_ms: 0,
+        }
+    }
+
+    #[test]
+    fn null_pointer_with_zero_length_is_an_empty_payload() {
+        let request = request(ptr::null(), 0);
+        let payload = unsafe { request_payload(&request) }.expect("empty payload is valid");
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn null_pointer_with_nonzero_length_is_rejected() {
+        let request = request(ptr::null(), 1);
+        assert_eq!(
+            unsafe { request_payload(&request) }.expect_err("invalid payload must fail"),
+            "request payload is null with non-zero length"
+        );
+    }
+
+    #[test]
+    fn nonempty_payload_is_borrowed_without_truncation() {
+        let bytes = b"a\0b";
+        let request = request(bytes.as_ptr(), bytes.len());
+        assert_eq!(
+            unsafe { request_payload(&request) }.expect("payload is valid"),
+            bytes
+        );
+    }
 }
 
 fn describe_throwable(env: &mut JNIEnv, throwable: &JThrowable<'_>) -> Option<String> {
