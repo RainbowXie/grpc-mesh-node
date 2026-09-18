@@ -44,6 +44,7 @@ impl TryFrom<i32> for MeshNodeBusinessCode {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum ResponseBody {
     Ok(Vec<u8>),
     Err {

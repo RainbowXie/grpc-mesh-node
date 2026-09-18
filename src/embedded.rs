@@ -137,6 +137,10 @@ pub struct EmbeddedNodeConfig {
     pub reconnect_max_delay: Duration,
     /// A connection healthy for at least this long resets the backoff.
     pub healthy_reset_after: Duration,
+    /// After shutdown fires, how long the tunnel gets to finish in-flight
+    /// requests before the serve future is dropped (force-closing the
+    /// tunnel). Bounded shutdown must not depend on peers closing first.
+    pub stop_grace: Duration,
 }
 
 impl EmbeddedNodeConfig {
@@ -237,6 +241,7 @@ impl EmbeddedNodeConfig {
             reconnect_base_delay: Duration::from_millis(file.reconnect.base_delay_ms),
             reconnect_max_delay: Duration::from_millis(file.reconnect.max_delay_ms),
             healthy_reset_after: Duration::from_secs(file.reconnect.healthy_reset_secs),
+            stop_grace: Duration::from_secs(file.shutdown.grace_secs),
         })
     }
 
@@ -279,6 +284,27 @@ struct ConfigFile {
     reconnect: ReconnectSection,
     #[serde(default)]
     connect: ConnectSection,
+    #[serde(default)]
+    shutdown: ShutdownSection,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownSection {
+    #[serde(default = "default_stop_grace_secs")]
+    grace_secs: u64,
+}
+
+impl Default for ShutdownSection {
+    fn default() -> Self {
+        Self {
+            grace_secs: default_stop_grace_secs(),
+        }
+    }
+}
+
+fn default_stop_grace_secs() -> u64 {
+    2
 }
 
 #[derive(Deserialize)]
@@ -735,17 +761,30 @@ async fn supervise(
             "embedded node tunnel established with automatic heartbeat"
         );
 
-        let grpc = tonic::transport::Server::builder()
+        let mut grpc = std::pin::pin!(tonic::transport::Server::builder()
             .add_service(InvokeService::new(inner.registry.clone()).into_server())
-            .serve_with_incoming_shutdown(incoming, shutdown_changed(shutdown_rx.clone()));
+            .serve_with_incoming_shutdown(incoming, shutdown_changed(shutdown_rx.clone())));
 
         tokio::select! {
-            result = grpc => match result {
+            result = &mut grpc => match result {
                 Ok(()) => tracing::warn!("embedded node tunnel ended; reconnecting"),
                 Err(err) => tracing::warn!(%err, "embedded node gRPC serving failed; reconnecting"),
             },
             _ = wait_tunnel_dead(tunnel_dead_rx.clone()) => {
                 tracing::warn!("embedded node heartbeat writes stalled; tunnel presumed dead, reconnecting");
+            },
+            _ = shutdown_changed(shutdown_rx.clone()) => {
+                // Bounded graceful window: in-flight requests get a chance,
+                // but shutdown never waits on peers or wedged responses.
+                if tokio::time::timeout(inner.config.stop_grace, &mut grpc)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        grace = ?inner.config.stop_grace,
+                        "graceful serve did not conclude in time; force-closing tunnel"
+                    );
+                }
             }
         }
 

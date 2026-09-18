@@ -76,6 +76,19 @@ pub const MESH_NODE_ERR_INTERNAL: i32 = 5;
 pub const MESH_NODE_STATE_INVALID: i32 = 0;
 
 // ---------------------------------------------------------------------------
+// Business error codes for host callbacks (mesh_node_response_error)
+// ---------------------------------------------------------------------------
+
+/// Business error code: configuration / precondition failure.
+pub const MESH_NODE_BUSINESS_CONFIG: i32 = 1;
+/// Business error code: the requested entity does not exist.
+pub const MESH_NODE_BUSINESS_NOT_FOUND: i32 = 2;
+/// Business error code: transport / downstream failure.
+pub const MESH_NODE_BUSINESS_TRANSPORT: i32 = 3;
+/// Business error code: generic internal failure.
+pub const MESH_NODE_BUSINESS_INTERNAL: i32 = 4;
+
+// ---------------------------------------------------------------------------
 // ABI types
 // ---------------------------------------------------------------------------
 
@@ -98,8 +111,13 @@ pub struct MeshNodeRequest {
 /// Host callback: process `request`, return a response handle created via
 /// `mesh_node_response_ok` / `mesh_node_response_error`. Returning `0`
 /// signals an internal error.
+///
+/// The ABI is declared unwind-permitting (`C-unwind`): a Rust host callback
+/// that panics is caught by the library and converted to an internal error
+/// instead of aborting the process. Plain C callbacks that never unwind are
+/// unaffected.
 pub type MeshNodeMethodCallback =
-    unsafe extern "C" fn(request: *const MeshNodeRequest, user_data: *mut c_void) -> MeshNodeResponse;
+    unsafe extern "C-unwind" fn(request: *const MeshNodeRequest, user_data: *mut c_void) -> MeshNodeResponse;
 
 /// Node handle: opaque, monotonic, never reused; `0` is the failure sentinel.
 pub type MeshNodeHandle = u64;
@@ -286,7 +304,7 @@ fn borrow_cstr<'a>(ptr: *const c_char, name: &str) -> FfiResult<&'a CStr> {
 // ---------------------------------------------------------------------------
 
 /// Returns the ABI version of this library (major << 16 | minor).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_abi_version() -> u32 {
     MESH_NODE_ABI_VERSION
 }
@@ -299,7 +317,7 @@ pub extern "C" fn mesh_node_abi_version() -> u32 {
 /// # Safety
 /// `config_json` must point to a valid NUL-terminated UTF-8 string for the
 /// duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn mesh_node_new(config_json: *const c_char) -> MeshNodeHandle {
     guarded("mesh_node_new", || {
         let json = borrow_cstr(config_json, "config_json")?
@@ -340,7 +358,7 @@ pub unsafe extern "C" fn mesh_node_new(config_json: *const c_char) -> MeshNodeHa
 /// valid (per the host's own contract) until the node is freed after a
 /// successful stop. `replaced_user_data`, when non-null, must point to
 /// writable memory.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn mesh_node_register_method(
     node: MeshNodeHandle,
     method: *const c_char,
@@ -364,7 +382,7 @@ pub unsafe extern "C" fn mesh_node_register_method(
             ));
         }
 
-        let mut state = entry.state.lock().expect("state lock poisoned");
+        let state = entry.state.lock().expect("state lock poisoned");
         if *state != AbiState::Created {
             return Err(ffi_err(
                 MESH_NODE_ERR_INVALID_STATE,
@@ -391,7 +409,7 @@ pub unsafe extern "C" fn mesh_node_register_method(
         }
         Ok(MESH_NODE_OK)
     })
-    .unwrap_or(MESH_NODE_ERR_INTERNAL)
+    .map_or_else(|err| err.status, |status| status)
 }
 
 /// Removes the callback registered for `method` on a `Created` node.
@@ -403,7 +421,7 @@ pub unsafe extern "C" fn mesh_node_register_method(
 /// # Safety
 /// `method` must be a valid NUL-terminated string; `removed_user_data`,
 /// when non-null, must point to writable memory.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn mesh_node_unregister_method(
     node: MeshNodeHandle,
     method: *const c_char,
@@ -419,7 +437,7 @@ pub unsafe extern "C" fn mesh_node_unregister_method(
             })?
             .to_owned();
 
-        let mut state = entry.state.lock().expect("state lock poisoned");
+        let state = entry.state.lock().expect("state lock poisoned");
         if *state != AbiState::Created {
             return Err(ffi_err(
                 MESH_NODE_ERR_INVALID_STATE,
@@ -446,7 +464,7 @@ pub unsafe extern "C" fn mesh_node_unregister_method(
         }
         Ok(MESH_NODE_OK)
     })
-    .unwrap_or(MESH_NODE_ERR_INTERNAL)
+    .map_or_else(|err| err.status, |status| status)
 }
 
 /// Starts the node: validates the configuration, freezes and reports the
@@ -454,7 +472,7 @@ pub unsafe extern "C" fn mesh_node_unregister_method(
 ///
 /// Blocks until the runtime is alive (or configuration fails, which is
 /// terminal — create a new node).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_start(node: MeshNodeHandle) -> i32 {
     guarded("mesh_node_start", || {
         let entry = lookup(node)
@@ -486,7 +504,10 @@ pub extern "C" fn mesh_node_start(node: MeshNodeHandle) -> i32 {
         for (name, reg) in registrations {
             let gate = Arc::clone(&entry.gate);
             let handler: MethodHandlerWithRequest = Arc::new(move |request| {
-                dispatch_callback(&gate, reg.callback, reg.user_data, request)
+                // Borrow the whole registration so the closure captures the
+                // struct (whose unsafe Send/Sync impl covers the raw pointer)
+                // instead of disjoint-capturing the raw `user_data` field.
+                dispatch_callback(&gate, &reg, request)
             });
             if let Err(err) = entry.node.register_method_with_request(name, handler) {
                 let mut state = entry.state.lock().expect("state lock poisoned");
@@ -506,7 +527,7 @@ pub extern "C" fn mesh_node_start(node: MeshNodeHandle) -> i32 {
             }
         }
     })
-    .unwrap_or(MESH_NODE_ERR_INTERNAL)
+    .map_or_else(|err| err.status, |status| status)
 }
 
 /// Requests a bounded stop.
@@ -515,7 +536,7 @@ pub extern "C" fn mesh_node_start(node: MeshNodeHandle) -> i32 {
 /// supervisor to drain. Returns `MESH_NODE_ERR_SHUTDOWN_TIMEOUT` on timeout
 /// (retryable; resources are retained). Stopping a `Created` or already
 /// stopped node is a successful no-op.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_stop(node: MeshNodeHandle, timeout_ms: u32) -> i32 {
     guarded("mesh_node_stop", || {
         let entry = lookup(node)
@@ -554,7 +575,7 @@ pub extern "C" fn mesh_node_stop(node: MeshNodeHandle, timeout_ms: u32) -> i32 {
             }
         }
     })
-    .unwrap_or(MESH_NODE_ERR_INTERNAL)
+    .map_or_else(|err| err.status, |status| status)
 }
 
 /// Removes a node from the handle table. The handle becomes invalid
@@ -567,7 +588,7 @@ pub extern "C" fn mesh_node_stop(node: MeshNodeHandle, timeout_ms: u32) -> i32 {
 /// # Safety
 /// Host-owned `user_data` pointers are not freed by the library; releasing
 /// them is only safe after a successful stop.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_free(node: MeshNodeHandle) {
     let outcome = guarded("mesh_node_free", || {
         let entry = NODES
@@ -593,7 +614,7 @@ pub extern "C" fn mesh_node_free(node: MeshNodeHandle) {
 
 /// Returns the node's lifecycle state, or `MESH_NODE_STATE_INVALID` (0) for
 /// an unknown handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_state(node: MeshNodeHandle) -> i32 {
     guarded("mesh_node_state", || {
         let entry = lookup(node)
@@ -608,7 +629,7 @@ pub extern "C" fn mesh_node_state(node: MeshNodeHandle) -> i32 {
 ///
 /// The string is library-owned and stays valid until the next ABI call on
 /// this thread. Callers must not free or mutate it.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_last_error() -> *const c_char {
     guarded("mesh_node_last_error", || Ok::<(), FfiError>(()))
         .ok();
@@ -624,7 +645,7 @@ pub extern "C" fn mesh_node_last_error() -> *const c_char {
 ///
 /// # Safety
 /// `data` must be readable for `len` bytes when `len > 0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn mesh_node_response_ok(
     data: *const u8,
     len: usize,
@@ -639,7 +660,7 @@ pub unsafe extern "C" fn mesh_node_response_ok(
                 "data must not be null when len > 0",
             ));
         }
-        let bytes = std::slice::from_raw_parts(data, len).to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
         Ok(response::response_ok(bytes))
     })
     .unwrap_or(0)
@@ -649,7 +670,7 @@ pub unsafe extern "C" fn mesh_node_response_ok(
 ///
 /// # Safety
 /// `message` must be a valid NUL-terminated UTF-8 string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn mesh_node_response_error(
     code: i32,
     message: *const c_char,
@@ -676,7 +697,7 @@ pub unsafe extern "C" fn mesh_node_response_error(
 }
 
 /// Payload length of a success response (0 otherwise, including stale handles).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_response_len(handle: MeshNodeResponse) -> usize {
     guarded("mesh_node_response_len", || Ok(response::response_len(handle)))
         .unwrap_or(0)
@@ -687,7 +708,7 @@ pub extern "C" fn mesh_node_response_len(handle: MeshNodeResponse) -> usize {
 ///
 /// # Safety
 /// `out` must be writable for `cap` bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn mesh_node_response_read(
     handle: MeshNodeResponse,
     out: *mut u8,
@@ -703,7 +724,7 @@ pub unsafe extern "C" fn mesh_node_response_read(
                 "out must not be null when cap > 0",
             ));
         }
-        let buffer = std::slice::from_raw_parts_mut(out, cap);
+        let buffer = unsafe { std::slice::from_raw_parts_mut(out, cap) };
         Ok(response::response_read(handle, buffer))
     })
     .unwrap_or(0)
@@ -712,7 +733,7 @@ pub unsafe extern "C" fn mesh_node_response_read(
 /// Releases a response handle. Idempotent and stale-safe: ids are never
 /// reused, so releasing twice (or releasing a handle the library already
 /// consumed) can never affect a live response.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn mesh_node_response_release(handle: MeshNodeResponse) {
     let _ = guarded("mesh_node_response_release", || {
         response::release(handle);
@@ -726,7 +747,7 @@ pub extern "C" fn mesh_node_response_release(handle: MeshNodeResponse) {
 
 fn map_business_error(body: ResponseBody) -> RpcError {
     let ResponseBody::Err { code, message } = body else {
-        return RpcError::Internal("internal mismatch: expected error response");
+        return RpcError::Internal("internal mismatch: expected error response".to_owned());
     };
     match code {
         MeshNodeBusinessCode::Config => RpcError::Config(message.to_string_lossy().into_owned()),
@@ -748,8 +769,7 @@ fn map_business_error(body: ResponseBody) -> RpcError {
 /// into the core's `RpcResult`. Panics never escape this boundary.
 fn dispatch_callback(
     gate: &Arc<CallbackGate>,
-    callback: MeshNodeMethodCallback,
-    user_data: *mut c_void,
+    registration: &MethodRegistration,
     request: grpc_mesh::RpcRequest,
 ) -> RpcResult<Vec<u8>> {
     if !gate.enter() {
@@ -758,7 +778,12 @@ fn dispatch_callback(
         ));
     }
 
-    let outcome = run_callback(gate, callback, user_data, request);
+    let outcome = run_callback(
+        gate,
+        registration.callback,
+        registration.user_data,
+        request,
+    );
     gate.exit();
     outcome
 }

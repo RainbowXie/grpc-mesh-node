@@ -28,6 +28,7 @@ fn offline_config() -> EmbeddedNodeConfig {
         reconnect_base_delay: Duration::from_millis(50),
         reconnect_max_delay: Duration::from_millis(200),
         healthy_reset_after: Duration::from_secs(60),
+        stop_grace: Duration::from_secs(2),
     }
 }
 

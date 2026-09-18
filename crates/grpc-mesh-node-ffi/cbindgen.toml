@@ -1,0 +1,5 @@
+language = "C"
+include_guard = "GRPC_MESH_NODE_ABI_H"
+usize_is_size_t = true
+documentation = true
+documentation_style = "doxy"

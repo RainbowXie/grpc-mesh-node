@@ -116,6 +116,7 @@ impl FakeMeshServer {
             reconnect_base_delay: Duration::from_millis(50),
             reconnect_max_delay: Duration::from_millis(200),
             healthy_reset_after: Duration::from_secs(60),
+            stop_grace: Duration::from_secs(2),
         }
     }
 
@@ -166,6 +167,9 @@ async fn server_task(
         // YamuxIncoming). Keep a driver task on the connection for the whole
         // session and share it with the dial-back helper through a mutex.
         let conn = Arc::new(std::sync::Mutex::new(conn));
+        // The driver signals drain readers before it exits: polling a yamux
+        // stream after its connection driver is gone can spin inside yamux.
+        let (driver_done_tx, mut driver_done_rx) = tokio::sync::watch::channel(false);
         {
             let conn = Arc::clone(&conn);
             tokio::spawn(async move {
@@ -183,6 +187,7 @@ async fn server_task(
                         Some(Err(_)) | None => break,
                     }
                 }
+                let _ = driver_done_tx.send(true);
             });
         }
 
@@ -204,17 +209,25 @@ async fn server_task(
                 use tokio::io::AsyncReadExt;
                 let mut buf = [0u8; 4096];
                 loop {
-                    match control.read(&mut buf).await {
-                        Ok(0) | Err(_) => {
+                    tokio::select! {
+                        read = control.read(&mut buf) => match read {
+                            Ok(0) | Err(_) => {
+                                closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                break;
+                            }
+                            Ok(n) => {
+                                // Each heartbeat is a length-prefixed frame; a
+                                // read batch may cover more than one.
+                                if n > 0 {
+                                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                        },
+                        // The driver only exits when the connection itself
+                        // ended — the same EOF proof the read path yields.
+                        _ = driver_done_rx.changed() => {
                             closed.store(true, std::sync::atomic::Ordering::SeqCst);
                             break;
-                        }
-                        Ok(n) => {
-                            // Each heartbeat is a length-prefixed frame; a read
-                            // batch may cover more than one, so count bytes>0.
-                            if n > 0 {
-                                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
                         }
                     }
                 }
@@ -429,6 +442,7 @@ async fn embedded_node_tolerates_unreachable_server() {
         reconnect_base_delay: Duration::from_millis(50),
         reconnect_max_delay: Duration::from_millis(100),
         healthy_reset_after: Duration::from_secs(60),
+        stop_grace: Duration::from_secs(2),
     };
 
     let node = EmbeddedNode::new(cfg);

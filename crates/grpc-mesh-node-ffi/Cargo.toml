@@ -9,3 +9,16 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 grpc-mesh = { path = "../.." }
+
+[dev-dependencies]
+cbindgen = "0.29"
+cc = "1"
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tonic = { version = "0.14", features = ["transport"] }
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+yamux = { version = "0.13", default-features = false }
+futures = "0.3"
