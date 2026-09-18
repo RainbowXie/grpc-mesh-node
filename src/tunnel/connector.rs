@@ -31,7 +31,7 @@ use super::incoming::YamuxIncoming;
 /// # Example
 ///
 /// ```no_run
-/// use grpc_mesh_node::tunnel::ConnectorConfig;
+/// use grpc_mesh::tunnel::ConnectorConfig;
 /// use std::time::Duration;
 ///
 /// let config = ConnectorConfig {
@@ -41,6 +41,7 @@ use super::incoming::YamuxIncoming;
 ///     connect_timeout: Duration::from_secs(10),
 ///     max_backoff: Duration::from_secs(30),
 ///     heartbeat_interval: Duration::from_secs(15),
+///     insecure_skip_verify: false,
 /// };
 /// ```
 #[derive(Debug, Clone)]
@@ -205,7 +206,7 @@ impl Tunnel {
     /// # Example
     ///
     /// ```no_run
-    /// # use grpc_mesh_node::tunnel::*;
+    /// # use grpc_mesh::tunnel::*;
     /// # async fn example(tunnel: &Tunnel) {
     /// let handshake = tunnel.handshake();
     /// println!("Connected as node: {}", handshake.node_id);
@@ -246,7 +247,7 @@ impl Tunnel {
     /// # Example
     ///
     /// ```no_run
-    /// # use grpc_mesh_node::tunnel::*;
+    /// # use grpc_mesh::tunnel::*;
     /// # async fn example(mut tunnel: Tunnel) -> Result<(), Box<dyn std::error::Error>> {
     /// let incoming = tunnel.take_incoming().expect("incoming already taken");
     /// // Use with tonic server
@@ -276,7 +277,7 @@ impl Tunnel {
     /// # Example
     ///
     /// ```no_run
-    /// # use grpc_mesh_node::tunnel::*;
+    /// # use grpc_mesh::tunnel::*;
     /// # async fn example(tunnel: Tunnel) {
     /// let (handshake, incoming, mut control_stream) = tunnel.into_parts();
     /// println!("Node ID: {}", handshake.node_id);
@@ -495,12 +496,12 @@ fn classify_tls_handshake_error(err: std::io::Error) -> TunnelError {
 /// # Example
 ///
 /// ```no_run
-/// use grpc_mesh_node::tunnel::{ConnectorConfig, TunnelConnector, HandshakeBuilder};
+/// use grpc_mesh::tunnel::{ConnectorConfig, TunnelConnector, Handshake};
 /// use tokio::sync::watch;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = ConnectorConfig::default();
-/// let handshake = HandshakeBuilder::new("my-node-id").build()?;
+/// let handshake = Handshake::builder("my-node-id", "0.0.1").build()?;
 /// let (shutdown_tx, shutdown_rx) = watch::channel(false);
 ///
 /// let mut connector = TunnelConnector::new(config, shutdown_rx)?;
@@ -536,7 +537,7 @@ impl TunnelConnector {
     /// # Example
     ///
     /// ```no_run
-    /// use grpc_mesh_node::tunnel::{ConnectorConfig, TunnelConnector};
+    /// use grpc_mesh::tunnel::{ConnectorConfig, TunnelConnector};
     /// use tokio::sync::watch;
     ///
     /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -592,16 +593,14 @@ impl TunnelConnector {
     /// # Example
     ///
     /// ```no_run
-    /// use grpc_mesh_node::tunnel::{ConnectorConfig, TunnelConnector, HandshakeBuilder};
-    /// use grpc_mesh_node::rpc::InvokeService;
-    /// use grpc_mesh_node::MethodRegistry;
+    /// use grpc_mesh::tunnel::{ConnectorConfig, TunnelConnector, Handshake};
+    /// use grpc_mesh::rpc::InvokeService;
+    /// use grpc_mesh::MethodRegistry;
     /// use tokio::sync::watch;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let config = ConnectorConfig::default();
-    /// let handshake = HandshakeBuilder::new("my-node-id")
-    ///     .version("1.0.0")
-    ///     .build()?;
+    /// let handshake = Handshake::builder("my-node-id", "1.0.0").build()?;
     /// let (_tx, rx) = watch::channel(false);
     ///
     /// let mut connector = TunnelConnector::new(config, rx)?;

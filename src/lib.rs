@@ -14,7 +14,7 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use grpc_mesh_node::{MethodRegistry, RpcResult, tunnel, rpc};
+//! use grpc_mesh::{MethodRegistry, RpcResult, tunnel, rpc};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,9 +32,7 @@
 //!     server_addr: "mesh-server.example.com:8443".into(),
 //!     ..Default::default()
 //! };
-//! let handshake = tunnel::HandshakeBuilder::new("my-node-id")
-//!     .version("1.0.0")
-//!     .build()?;
+//! let handshake = tunnel::Handshake::builder("my-node-id", "1.0.0").build()?;
 //!
 //! let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 //! let mut connector = tunnel::TunnelConnector::new(config, shutdown_rx)?;
@@ -82,6 +80,7 @@
 //!          gRPC-Mesh Server
 //! ```
 
+pub mod embedded;
 pub mod rpc;
 pub mod tunnel;
 
@@ -98,7 +97,7 @@ use std::time::Duration;
 /// # Example
 ///
 /// ```
-/// use grpc_mesh_node::{RpcResult, RpcError};
+/// use grpc_mesh::{RpcResult, RpcError};
 ///
 /// fn validate_input(data: &[u8]) -> RpcResult<()> {
 ///     if data.is_empty() {
@@ -117,7 +116,7 @@ pub type RpcResult<T> = Result<T, RpcError>;
 /// # Example
 ///
 /// ```
-/// use grpc_mesh_node::{RpcError, MethodRegistry};
+/// use grpc_mesh::{RpcError, MethodRegistry};
 /// use std::sync::Arc;
 ///
 /// let registry = MethodRegistry::default();
@@ -182,7 +181,7 @@ impl RpcError {
     /// # Example
     ///
     /// ```
-    /// use grpc_mesh_node::RpcError;
+    /// use grpc_mesh::RpcError;
     ///
     /// let err = RpcError::MethodNotFound("calculator.add".into());
     /// assert_eq!(err.code(), "NOT_FOUND");
@@ -206,7 +205,7 @@ impl RpcError {
 /// # Example
 ///
 /// ```
-/// use grpc_mesh_node::RpcRequest;
+/// use grpc_mesh::RpcRequest;
 /// use std::time::Duration;
 ///
 /// let request = RpcRequest {
@@ -251,7 +250,7 @@ pub struct RpcRequest {
 /// # Example
 ///
 /// ```
-/// use grpc_mesh_node::{RpcResponse, RpcError};
+/// use grpc_mesh::{RpcResponse, RpcError};
 /// use std::time::Duration;
 ///
 /// // Successful response
@@ -308,15 +307,16 @@ pub struct RpcResponse {
 /// # Example
 ///
 /// ```
-/// use grpc_mesh_node::{MethodHandler, RpcResult};
+/// use grpc_mesh::{MethodHandler, RpcError, RpcResult};
 /// use std::sync::Arc;
 ///
 /// let add_handler: MethodHandler = Arc::new(|payload: Vec<u8>| -> RpcResult<Vec<u8>> {
-///     let input: serde_json::Value = serde_json::from_slice(&payload)?;
+///     let input: serde_json::Value =
+///         serde_json::from_slice(&payload).map_err(|e| RpcError::Internal(e.to_string()))?;
 ///     let a = input["a"].as_i64().unwrap_or(0);
 ///     let b = input["b"].as_i64().unwrap_or(0);
 ///     let result = serde_json::json!({"result": a + b});
-///     Ok(serde_json::to_vec(&result)?)
+///     Ok(serde_json::to_vec(&result).map_err(|e| RpcError::Internal(e.to_string()))?)
 /// });
 /// ```
 pub type MethodHandler = Arc<dyn Fn(Vec<u8>) -> RpcResult<Vec<u8>> + Send + Sync>;
@@ -337,7 +337,7 @@ pub type MethodHandlerWithRequest = Arc<dyn Fn(RpcRequest) -> RpcResult<Vec<u8>>
 /// # Example
 ///
 /// ```
-/// use grpc_mesh_node::{MethodRegistry, RpcResult};
+/// use grpc_mesh::{MethodRegistry, RpcResult};
 /// use std::sync::Arc;
 ///
 /// let registry = MethodRegistry::default();
@@ -385,17 +385,18 @@ impl MethodRegistry {
     /// # Example
     ///
     /// ```
-    /// use grpc_mesh_node::{MethodRegistry, RpcResult};
+    /// use grpc_mesh::{MethodRegistry, RpcError, RpcResult};
     /// use std::sync::Arc;
     ///
     /// let registry = MethodRegistry::default();
     ///
     /// registry.register("calculator.add", Arc::new(|payload: Vec<u8>| -> RpcResult<Vec<u8>> {
-    ///     let input: serde_json::Value = serde_json::from_slice(&payload)?;
+    ///     let input: serde_json::Value =
+///         serde_json::from_slice(&payload).map_err(|e| RpcError::Internal(e.to_string()))?;
     ///     let a = input["a"].as_i64().unwrap_or(0);
     ///     let b = input["b"].as_i64().unwrap_or(0);
     ///     let result = serde_json::json!({"result": a + b});
-    ///     Ok(serde_json::to_vec(&result)?)
+    ///     Ok(serde_json::to_vec(&result).map_err(|e| RpcError::Internal(e.to_string()))?)
     /// }));
     /// ```
     pub fn register<S: Into<String>>(&self, method: S, handler: MethodHandler) {
@@ -436,7 +437,7 @@ impl MethodRegistry {
     /// # Example
     ///
     /// ```
-    /// use grpc_mesh_node::MethodRegistry;
+    /// use grpc_mesh::MethodRegistry;
     /// use std::sync::Arc;
     ///
     /// let registry = MethodRegistry::default();
@@ -480,7 +481,7 @@ impl MethodRegistry {
     /// # Example
     ///
     /// ```
-    /// use grpc_mesh_node::{MethodRegistry, RpcError};
+    /// use grpc_mesh::{MethodRegistry, RpcError};
     /// use std::sync::Arc;
     ///
     /// let registry = MethodRegistry::default();
@@ -554,7 +555,7 @@ impl MethodRegistry {
     /// # Example
     ///
     /// ```
-    /// use grpc_mesh_node::MethodRegistry;
+    /// use grpc_mesh::MethodRegistry;
     /// use std::sync::Arc;
     ///
     /// let registry = MethodRegistry::default();
@@ -712,7 +713,7 @@ impl RpcClient {
 /// # Example
 ///
 /// ```
-/// use grpc_mesh_node::fmt_duration;
+/// use grpc_mesh::fmt_duration;
 /// use std::time::Duration;
 ///
 /// let d = Duration::from_millis(1234);

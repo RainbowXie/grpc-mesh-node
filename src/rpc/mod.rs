@@ -59,7 +59,7 @@ const STREAM_BUFFER: usize = 16;
 /// # Example
 ///
 /// ```no_run
-/// use grpc_mesh_node::{MethodRegistry, rpc::InvokeService};
+/// use grpc_mesh::{MethodRegistry, rpc::InvokeService};
 /// use std::sync::Arc;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -98,7 +98,7 @@ impl InvokeService {
     /// # Example
     ///
     /// ```
-    /// use grpc_mesh_node::{MethodRegistry, rpc::InvokeService};
+    /// use grpc_mesh::{MethodRegistry, rpc::InvokeService};
     /// use std::sync::Arc;
     ///
     /// let registry = MethodRegistry::default();
@@ -123,7 +123,7 @@ impl InvokeService {
     /// # Example
     ///
     /// ```no_run
-    /// use grpc_mesh_node::{MethodRegistry, rpc::InvokeService};
+    /// use grpc_mesh::{MethodRegistry, rpc::InvokeService};
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let registry = MethodRegistry::default();

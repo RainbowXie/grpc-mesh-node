@@ -1,0 +1,11 @@
+[package]
+name = "grpc-mesh-node-ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "grpc_mesh_node"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+grpc-mesh = { path = "../.." }
