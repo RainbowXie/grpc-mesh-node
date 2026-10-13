@@ -530,8 +530,17 @@ async fn embedded_node_tolerates_unreachable_server() {
 /// and a clean close. It reuses [`FakeMeshServer`] rather than a capture-only
 /// probe, so the close check is a real lifecycle assertion.
 ///
-/// Requires `javac`/`java` (JDK 17) and a host cdylib built with
-/// `cargo build -p grpc-mesh-node-ffi --target x86_64-unknown-linux-gnu`.
+/// Prerequisites (fail loudly rather than skip — a missing prerequisite must
+/// never silently drop the only Java-side evidence):
+/// 1. Must run from inside the parent `grpc-mesh` checkout, where the binding
+///    lives at `<parent>/bindings/java` (a sibling of this node submodule).
+///    `java_bindings_dir()` resolves that path from `CARGO_MANIFEST_DIR`'s
+///    parent, so a standalone node-repo checkout without the parent fails fast
+///    in `collect_java_sources` instead of pretending to pass.
+/// 2. A JDK 17 `javac` and `java` on `PATH` (the driver is compiled with
+///    `javac --release 17` and run in a child JVM).
+/// 3. A prebuilt host cdylib:
+///    `cargo build -p grpc-mesh-node-ffi --target x86_64-unknown-linux-gnu`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn java_binding_jni_handshake_over_real_control_protocol() {
     let server = FakeMeshServer::start().await;
