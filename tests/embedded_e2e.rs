@@ -6,6 +6,9 @@
 //! method semantics, business-error propagation, connection failure
 //! tolerance, and clean shutdown with no residual connections.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -425,6 +428,71 @@ async fn embedded_node_serves_generic_invoke_over_real_tunnel() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_advertises_normalized_features_and_verbatim_metadata() {
+    let server = FakeMeshServer::start().await;
+    let mut config = server.node_config("handshake-fields");
+    config.features = vec![" DG ".into(), "dg".into(), "Report".into()];
+    config.metadata = [
+        ("capability".to_owned(), "dg".to_owned()),
+        ("padded".to_owned(), "  text  ".to_owned()),
+        ("empty".to_owned(), String::new()),
+    ]
+    .into_iter()
+    .collect();
+    let node = EmbeddedNode::new(config);
+
+    // Register/replace/unregister before start: only the final live set may
+    // be reported.
+    node.register_method("calculator.v1.Calculator/Add", Arc::new(|p| Ok(p)))
+        .expect("register Add");
+    node.register_method("calculator.v1.Calculator/Health", Arc::new(|p| Ok(p)))
+        .expect("register Health");
+    node.unregister_method("calculator.v1.Calculator/Health")
+        .expect("unregister Health");
+    node.register_method("b.only", Arc::new(|p| Ok(p))).expect("register b.only");
+
+    node.start().expect("node starts");
+    let handshake = server.wait_handshake().await;
+
+    // Features keep the existing Rust normalization: trim, lowercase, dedupe.
+    assert_eq!(handshake.supported_features, vec!["dg".to_owned(), "report".to_owned()]);
+    // Metadata values reach the wire character-for-character.
+    assert_eq!(handshake.metadata.get("capability").map(String::as_str), Some("dg"));
+    assert_eq!(handshake.metadata.get("padded").map(String::as_str), Some("  text  "));
+    assert_eq!(handshake.metadata.get("empty").map(String::as_str), Some(""));
+    // platform/arch stay framework-generated, not host-supplied.
+    assert!(handshake.metadata.get("platform").is_some_and(|v| !v.is_empty()));
+    assert!(handshake.metadata.get("arch").is_some_and(|v| !v.is_empty()));
+    // mesh.methods reflects the real registry, not a forged value.
+    assert_eq!(
+        handshake.metadata.get("mesh.methods").map(String::as_str),
+        Some("b.only,calculator.v1.Calculator/Add")
+    );
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    server.cmd_tx.send(ServerCmd::DropDialer { reply: tx }).unwrap();
+    rx.await.expect("dialer dropped");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    node.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_registry_handshake_completes_with_empty_method_list() {
+    let server = FakeMeshServer::start().await;
+    let node = EmbeddedNode::new(server.node_config("empty-registry"));
+
+    node.start().expect("node starts with no methods");
+    let handshake = server.wait_handshake().await;
+    assert_eq!(handshake.metadata.get("mesh.methods").map(String::as_str), Some(""));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    server.cmd_tx.send(ServerCmd::DropDialer { reply: tx }).unwrap();
+    rx.await.expect("dialer dropped");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    node.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn embedded_node_tolerates_unreachable_server() {
     let cfg = EmbeddedNodeConfig {
         server_addr: "127.0.0.1:1".into(),
@@ -454,4 +522,180 @@ async fn embedded_node_tolerates_unreachable_server() {
 
     node.stop(Duration::from_secs(5)).expect("stop while never connected");
     assert!(node.supervisor_finished());
+}
+
+/// Full Java → JNI → Rust path over the real control protocol: a separate JVM
+/// drives the public binding against the in-process TLS/yamux server, and this
+/// test asserts the captured handshake, a live invoke, reserved-key rejection
+/// and a clean close. It reuses [`FakeMeshServer`] rather than a capture-only
+/// probe, so the close check is a real lifecycle assertion.
+///
+/// Requires `javac`/`java` (JDK 17) and a host cdylib built with
+/// `cargo build -p grpc-mesh-node-ffi --target x86_64-unknown-linux-gnu`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn java_binding_jni_handshake_over_real_control_protocol() {
+    let server = FakeMeshServer::start().await;
+    let scratch = std::env::temp_dir().join(format!(
+        "grpc-mesh-java-e2e-{}-{}",
+        std::process::id(),
+        server.port
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let classes = compile_java_driver(&scratch);
+    let ca_file = scratch.join("ca.pem");
+    std::fs::write(&ca_file, &server.ca_cert_pem).expect("write ca");
+    let cdylib = find_host_cdylib();
+
+    let log_path = scratch.join("java.log");
+    let log = std::fs::File::create(&log_path).expect("java log");
+    let mut child = std::process::Command::new("java")
+        .arg("-cp")
+        .arg(&classes)
+        .arg(format!("-Dio.mesh.node.lib={}", cdylib.display()))
+        .arg(format!("-De2e.dir={}", scratch.display()))
+        .arg(format!("-De2e.caFile={}", ca_file.display()))
+        .arg("io.mesh.node.e2e.JavaHandshakeDriver")
+        .arg(format!("127.0.0.1:{}", server.port))
+        .arg("java-e2e-node")
+        .arg("test-token")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(log.try_clone().expect("clone log")))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn java driver");
+
+    let handshake = match tokio::time::timeout(Duration::from_secs(60), server.wait_handshake()).await {
+        Ok(handshake) => handshake,
+        Err(_) => {
+            let _ = child.kill();
+            panic!("java node did not complete the handshake; log:\n{}", read_log(&log_path));
+        }
+    };
+
+    assert_eq!(handshake.node_id, "java-e2e-node");
+    assert_eq!(
+        handshake.supported_features,
+        vec!["dg".to_owned(), "report".to_owned()]
+    );
+    assert_eq!(handshake.metadata.get("capability").map(String::as_str), Some("dg"));
+    assert_eq!(handshake.metadata.get("padded").map(String::as_str), Some("  text  "));
+    assert_eq!(handshake.metadata.get("empty").map(String::as_str), Some(""));
+    assert_eq!(
+        handshake.metadata.get("unicode").map(String::as_str),
+        Some("a\u{00A0}b\u{2007}c")
+    );
+    // platform/arch stay framework-generated, not host-supplied.
+    assert!(handshake.metadata.get("platform").is_some_and(|v| !v.is_empty()));
+    assert!(handshake.metadata.get("arch").is_some_and(|v| !v.is_empty()));
+    // register Health, register Add, unregister Health -> only Add remains.
+    assert_eq!(
+        handshake.metadata.get("mesh.methods").map(String::as_str),
+        Some("calculator.v1.Calculator/Add")
+    );
+
+    // The Java handler actually serves an invoke over the tunnel.
+    let resp = server.invoke("calculator.v1.Calculator/Add", b"ping".to_vec()).await;
+    assert!(resp.success, "invoke should succeed: {:?}", resp.error);
+    assert_eq!(resp.result, b"ping");
+
+    // The reserved key was rejected by the Java Builder, so no second
+    // connection was ever attempted.
+    let reserved = std::fs::read_to_string(scratch.join("reserved.txt")).unwrap_or_default();
+    assert_eq!(reserved, "REJECTED", "Java Builder must reject mesh.methods");
+
+    // Close through the public close() -> bounded native stop.
+    {
+        let stdin = child.stdin.as_mut().expect("child stdin");
+        stdin.write_all(b"stop\n").expect("signal stop");
+        stdin.flush().expect("flush stop");
+    }
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join child wait")
+        .expect("wait java");
+    assert!(
+        status.success(),
+        "java driver exit={status:?}; log:\n{}",
+        read_log(&log_path)
+    );
+
+    // The control session is gone after the node stopped.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    server.cmd_tx.send(ServerCmd::DropDialer { reply: tx }).unwrap();
+    rx.await.expect("dialer dropped");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    server.cmd_tx.send(ServerCmd::ControlClosed { reply: tx }).unwrap();
+    assert!(
+        rx.await.expect("closed probe"),
+        "control session should close after stop"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+fn read_log(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| format!("<cannot read log: {err}>"))
+}
+
+fn java_bindings_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace parent")
+        .join("bindings")
+        .join("java")
+}
+
+fn collect_java_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read java sources") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_java_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "java") {
+            out.push(path);
+        }
+    }
+}
+
+fn compile_java_driver(scratch: &Path) -> PathBuf {
+    let bindings = java_bindings_dir();
+    let mut sources = Vec::new();
+    collect_java_sources(
+        &bindings.join("node-core").join("src").join("main").join("java"),
+        &mut sources,
+    );
+    sources.push(bindings.join("e2e").join("JavaHandshakeDriver.java"));
+    let classes = scratch.join("classes");
+    std::fs::create_dir_all(&classes).expect("classes dir");
+    let status = std::process::Command::new("javac")
+        .arg("--release")
+        .arg("17")
+        .arg("-d")
+        .arg(&classes)
+        .args(&sources)
+        .status()
+        .expect("run javac (JDK 17 required for the host e2e harness)");
+    assert!(
+        status.success(),
+        "javac failed compiling the Java binding + driver"
+    );
+    classes
+}
+
+fn find_host_cdylib() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        root.join("target/x86_64-unknown-linux-gnu/debug/libgrpc_mesh_node.so"),
+        root.join("target/debug/libgrpc_mesh_node.so"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    panic!(
+        "host cdylib not found; build it first with `cargo build -p grpc-mesh-node-ffi \
+         --target x86_64-unknown-linux-gnu`"
+    );
 }

@@ -258,6 +258,125 @@ fn config_json_validation() {
 }
 
 #[test]
+fn valid_handshake_metadata_is_preserved_verbatim() {
+    let json = r#"{
+        "server": { "address": "127.0.0.1:8443" },
+        "node": {
+            "id": "n1", "token": "t1",
+            "features": [" DG ", "dg"],
+            "metadata": { "capability": "dg", "padded": "  text  ", "empty": "" }
+        }
+    }"#;
+    let cfg = EmbeddedNodeConfig::from_json(json).expect("valid config");
+    assert_eq!(cfg.metadata.get("padded").map(String::as_str), Some("  text  "));
+    assert_eq!(cfg.metadata.get("empty").map(String::as_str), Some(""));
+    assert_eq!(cfg.metadata.get("capability").map(String::as_str), Some("dg"));
+    // Normalization is the handshake's job, not config parsing's.
+    assert_eq!(cfg.features, vec![" DG ".to_owned(), "dg".to_owned()]);
+}
+
+#[test]
+fn reserved_metadata_keys_are_rejected_from_json() {
+    for key in ["mesh.methods", "platform", "arch"] {
+        let json = format!(
+            r#"{{
+                "server": {{ "address": "127.0.0.1:8443" }},
+                "node": {{ "id": "n1", "token": "t1", "metadata": {{ "{key}": "forged" }} }}
+            }}"#
+        );
+        match EmbeddedNodeConfig::from_json(&json) {
+            Err(EmbeddedError::Config(msg)) => assert!(msg.contains(key), "{msg}"),
+            other => panic!("expected reserved key {key} rejection, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn invalid_metadata_key_or_value_is_rejected_from_json() {
+    for (metadata, needle) in [
+        (r#"{ "": "v" }"#, "key"),
+        (r#"{ " padded ": "v" }"#, "padded"),
+        (r#"{ "k": null }"#, "k"),
+        (r#"{ "k": 7 }"#, "k"),
+        (r#"{ "k": true }"#, "k"),
+        (r#"{ "k": ["v"] }"#, "k"),
+    ] {
+        let json = format!(
+            r#"{{ "server": {{ "address": "127.0.0.1:8443" }}, "node": {{ "id": "n1", "token": "t1", "metadata": {metadata} }} }}"#
+        );
+        match EmbeddedNodeConfig::from_json(&json) {
+            Err(EmbeddedError::Config(msg)) => assert!(msg.contains(needle), "{msg}"),
+            other => panic!("expected rejection for {metadata}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn reserved_metadata_is_rejected_before_connecting_when_constructed_directly() {
+    for key in ["mesh.methods", "platform", "arch"] {
+        let mut config = offline_config();
+        config.metadata.insert(key.to_owned(), "forged".to_owned());
+        let node = EmbeddedNode::new(config);
+        match node.start() {
+            Err(EmbeddedError::Config(msg)) => assert!(msg.contains(key), "{msg}"),
+            other => panic!("expected reserved key {key} rejection at start, got {other:?}"),
+        }
+        assert_eq!(node.state(), NodeLifecycle::Stopped);
+    }
+}
+
+#[test]
+fn reserved_metadata_injected_after_parse_is_rejected_before_connecting() {
+    let json = r#"{
+        "server": { "address": "127.0.0.1:8443" },
+        "node": { "id": "n1", "token": "t1", "metadata": { "k": "v" } }
+    }"#;
+    let mut config = EmbeddedNodeConfig::from_json(json).expect("valid config");
+    // A host can still mutate the public field after parsing; the handshake
+    // boundary must re-check so JSON validation alone cannot be bypassed.
+    config
+        .metadata
+        .insert("mesh.methods".to_owned(), "fake.Service/NotRegistered".to_owned());
+    let node = EmbeddedNode::new(config);
+    match node.start() {
+        Err(EmbeddedError::Config(msg)) => assert!(msg.contains("mesh.methods"), "{msg}"),
+        other => panic!("expected Config rejection, got {other:?}"),
+    }
+    assert_eq!(node.state(), NodeLifecycle::Stopped);
+}
+
+#[test]
+fn unicode_whitespace_metadata_keys_are_rejected() {
+    // Dual of the Java NodeConfigTest case: both layers must treat the full
+    // Unicode White_Space set as whitespace-padded, not just ASCII. The keys
+    // are emitted as \uXXXX escapes so the JSON stays valid control-free.
+    for ws in ['\u{2003}', '\u{00A0}', '\u{0085}', '\u{2007}', '\u{202F}', '\u{3000}', '\u{1680}', '\u{205F}'] {
+        let esc = format!("\\u{:04X}", ws as u32);
+        for key in [format!("{esc}k"), format!("k{esc}"), esc.clone()] {
+            let json = format!(
+                r#"{{ "server": {{ "address": "127.0.0.1:8443" }}, "node": {{ "id": "n1", "token": "t1", "metadata": {{ "{key}": "v" }} }} }}"#
+            );
+            match EmbeddedNodeConfig::from_json(&json) {
+                Err(EmbeddedError::Config(_)) => {}
+                other => panic!("expected whitespace key {key:?} rejection, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_whitespace_inside_metadata_value_is_preserved() {
+    // Only key edges are whitespace-checked; values keep every character,
+    // including the non-breaking spaces the key check rejects.
+    let value = "a\u{00A0}b\u{2007}c\u{202F}d\u{0085}e\u{2003}f";
+    let json = format!(
+        r#"{{ "server": {{ "address": "127.0.0.1:8443" }}, "node": {{ "id": "n1", "token": "t1", "metadata": {{ "k": "{value}" }} }} }}"#
+    );
+    let cfg = EmbeddedNodeConfig::from_json(&json).expect("valid config");
+    assert_eq!(cfg.metadata.get("k").map(String::as_str), Some(value));
+}
+
+#[test]
 fn registry_errors_reach_callers_unchanged() {
     // Guards the facade contract that business errors are surfaced verbatim
     // through the existing MethodRegistry error model (the C ABI maps the
